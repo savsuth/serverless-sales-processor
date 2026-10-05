@@ -1,0 +1,21 @@
+# Weekly update proposals for Python packages, GitHub Actions, and the
+# Terraform providers. Each arrives as a pull request that runs CI.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: terraform
+    directories:
+      - /infra
+      - /infra/bootstrap
+    schedule:
+      interval: weekly
