@@ -81,6 +81,7 @@ class CuratedWriter:
 
     def __init__(self, schema: Schema, job_id: str) -> None:
         assert schema.curated_partition_column is not None
+        self._partition_column: str = schema.curated_partition_column
         self._schema = schema
         self._job_id = job_id
         column_names = set(schema.column_names)
@@ -93,7 +94,7 @@ class CuratedWriter:
         fields += [("job_id", self._job_id), ("source_row_number", row_number)]
         line = "{" + ",".join(f"{json.dumps(k)}:{_json_value(v)}" for k, v in fields) + "}\n"
 
-        month = values[self._schema.curated_partition_column][:7]  # YYYY-MM
+        month = values[self._partition_column][:7]  # YYYY-MM
         self._month_file(month).write(line.encode("utf-8"))
 
     def _month_file(self, month: str) -> gzip.GzipFile:

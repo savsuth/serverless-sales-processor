@@ -172,7 +172,7 @@ class JobStore:
     def claim(
         self, job_id: str, source_bucket: str, source_key: str, source_version_id: str
     ) -> ClaimResult:
-        from boto3.dynamodb.conditions import Attr
+        from boto3.dynamodb.conditions import Attr, ConditionBase
 
         now = int(time.time())
         token = uuid.uuid4().hex
@@ -211,6 +211,8 @@ class JobStore:
         status = record["status"]
         if status in TERMINAL_STATUSES:
             return ClaimResult(status=ClaimStatus.ALREADY_TERMINAL, record=record)
+
+        condition: ConditionBase
 
         if status == STATUS_PROCESSING:
             if int(record["lease_expires_at"]) >= now:

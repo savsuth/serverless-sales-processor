@@ -60,7 +60,7 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import IO, Any, TextIO
+from typing import IO, Any, Protocol, TextIO
 
 from file_pipeline.schema import Column, OutlierRule, Schema, load_schema
 
@@ -165,23 +165,29 @@ class ProcessingResult:
 GZIP_MAGIC = b"\x1f\x8b"
 
 
+class _Readable(Protocol):
+    """Anything with .read(n): a file, an S3 StreamingBody, a GzipFile."""
+
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
 class _StreamReader(io.RawIOBase):
     """Adapts any object with .read(n) (a file, an S3 StreamingBody) to
     the raw-stream interface io.BufferedReader needs."""
 
-    def __init__(self, source: IO[bytes]) -> None:
+    def __init__(self, source: _Readable) -> None:
         self._source = source
 
     def readable(self) -> bool:
         return True
 
-    def readinto(self, b: bytearray) -> int:  # type: ignore[override]
+    def readinto(self, b: Any) -> int:
         data = self._source.read(len(b))
         b[: len(data)] = data
         return len(data)
 
 
-def _decompressed(binary_stream: IO[bytes]) -> IO[bytes]:
+def _decompressed(binary_stream: _Readable) -> io.BufferedIOBase:
     buffered = io.BufferedReader(_StreamReader(binary_stream))
     if buffered.peek(len(GZIP_MAGIC))[: len(GZIP_MAGIC)] == GZIP_MAGIC:
         return gzip.GzipFile(fileobj=buffered, mode="rb")
@@ -194,7 +200,7 @@ class _CountingRawReader(io.RawIOBase):
     instead of only after being fully buffered. Also fingerprints the
     bytes as they pass, so no second read is needed."""
 
-    def __init__(self, source: IO[bytes], max_bytes: int) -> None:
+    def __init__(self, source: _Readable, max_bytes: int) -> None:
         self._source = source
         self._max_bytes = max_bytes
         self._read_bytes = 0
@@ -203,7 +209,7 @@ class _CountingRawReader(io.RawIOBase):
     def readable(self) -> bool:
         return True
 
-    def readinto(self, b: bytearray) -> int:  # type: ignore[override]
+    def readinto(self, b: Any) -> int:
         data = self._source.read(len(b))
         if not data:
             return 0
@@ -391,7 +397,7 @@ def _warning(row_numbers: list[int], **extra: Any) -> dict[str, Any]:
 
 def process_csv(
     binary_stream: IO[bytes],
-    rejected_csv_writer_target: TextIO,
+    rejected_csv_writer_target: IO[str],
     *,
     max_bytes: int = MAX_INPUT_BYTES,
     schema: Schema | None = None,
