@@ -48,3 +48,7 @@ infra/**/*.tfvars.json
 # Hypothesis example database
 .hypothesis/
 !infra/**/*.backend.hcl.example
+
+# Coverage data
+.coverage
+coverage.md
