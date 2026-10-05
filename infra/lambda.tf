@@ -40,7 +40,15 @@ resource "aws_lambda_function" "processor" {
       NOTIFICATION_TOPIC_ARN = aws_sns_topic.notifications.arn
       LEASE_SECONDS          = tostring(var.job_lease_seconds)
       MAX_INPUT_BYTES        = tostring(var.max_input_bytes)
+      SCHEMA_NAME            = var.schema_name
       LOG_LEVEL              = "INFO"
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = fileexists("${path.module}/../src/file_pipeline/schemas/${var.schema_name}.json")
+      error_message = "schema_name must name a file in src/file_pipeline/schemas/ (without .json)."
     }
   }
 

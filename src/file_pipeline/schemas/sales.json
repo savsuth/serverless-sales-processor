@@ -1,0 +1,16 @@
+{
+  "name": "sales",
+  "columns": [
+    { "name": "date", "type": "date" },
+    { "name": "product", "type": "string", "required": true },
+    { "name": "quantity", "type": "integer", "positive": true },
+    { "name": "unit_price", "type": "decimal", "non_negative": true }
+  ],
+  "aggregation": {
+    "group_by": "product",
+    "measures": [
+      { "name": "quantity", "multiply": ["quantity"] },
+      { "name": "revenue", "multiply": ["quantity", "unit_price"], "total": true }
+    ]
+  }
+}

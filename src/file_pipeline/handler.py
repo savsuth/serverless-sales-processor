@@ -24,7 +24,7 @@ import os
 import sys
 import tempfile
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -37,6 +37,7 @@ from file_pipeline.processor import (
     process_csv,
     summary_json_bytes,
 )
+from file_pipeline.schema import DEFAULT_SCHEMA, Schema, load_schema
 
 
 class _StdoutHandler(logging.StreamHandler):
@@ -102,6 +103,7 @@ class Dependencies:
     notifier: notifications.SNSNotifier
     output_bucket: str
     max_input_bytes: int = MAX_INPUT_BYTES
+    schema: Schema = field(default_factory=load_schema)
 
 
 def _default_dependencies() -> Dependencies:
@@ -119,6 +121,7 @@ def _default_dependencies() -> Dependencies:
         ),
         output_bucket=os.environ["OUTPUT_BUCKET_NAME"],
         max_input_bytes=int(os.environ.get("MAX_INPUT_BYTES", MAX_INPUT_BYTES)),
+        schema=load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA)),
     )
 
 
@@ -255,7 +258,9 @@ def _run_processing(
         ) as rejected_buffer,
     ):
         try:
-            result = process_csv(handle.body, rejected_buffer, max_bytes=deps.max_input_bytes)
+            result = process_csv(
+                handle.body, rejected_buffer, max_bytes=deps.max_input_bytes, schema=deps.schema
+            )
         except MalformedCSVError as exc:
             return _finish_validation_failed(
                 job_id, token, deps, error_code=exc.code, error_message=exc.message

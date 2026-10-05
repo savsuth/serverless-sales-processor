@@ -16,6 +16,12 @@ variable "max_input_bytes" {
   default     = 10485760 # 10 MiB
 }
 
+variable "schema_name" {
+  description = "Which bundled schema (src/file_pipeline/schemas/<name>.json) the Lambda validates and aggregates uploads with. One schema per deployment."
+  type        = string
+  default     = "sales"
+}
+
 # --- Lambda sizing ---------------------------------------------------------
 # Conservative defaults for a CSV up to 10 MiB. Revenue/quantity aggregation
 # scales with distinct product count (held in memory), not row count, and

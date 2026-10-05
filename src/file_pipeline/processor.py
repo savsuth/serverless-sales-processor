@@ -4,6 +4,10 @@ No AWS or filesystem-path dependencies live here: everything operates on
 file-like byte streams and text writers so the exact same code runs in the
 local CLI runner (local.py) and the Lambda handler (handler.py).
 
+Which columns are required, how each value is validated, and what gets
+added up all come from a schema (see schema.py); the default is the
+bundled sales schema.
+
 Design decisions (documented here because the task spec leaves them open):
 
 * Column matching is case-insensitive and ignores surrounding whitespace,
@@ -43,18 +47,18 @@ import io
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import IO, TextIO
+from typing import IO, Any, TextIO
+
+from file_pipeline.schema import Column, Schema, load_schema
 
 MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB
-
-REQUIRED_COLUMNS = ("date", "product", "quantity", "unit_price")
 
 _CHUNK_SIZE = 64 * 1024
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_QUANTITY_RE = re.compile(r"^\d+$")
-_UNIT_PRICE_RE = re.compile(r"^\d+(\.\d+)?$")
-_UNIT_PRICE_NEGATIVE_RE = re.compile(r"^-\d+(\.\d+)?$")
+_UNSIGNED_INTEGER_RE = re.compile(r"^\d+$")
+_SIGNED_INTEGER_RE = re.compile(r"^-?\d+$")
+_DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$")
 _NON_FINITE_TOKENS = {
     "nan",
     "inf",
@@ -91,19 +95,41 @@ class InputTooLargeError(Exception):
         self.max_bytes = max_bytes
 
 
-@dataclass(frozen=True)
-class ProductTotal:
-    quantity: int
-    revenue: Decimal
+class GroupTotals(dict):
+    """One group's measures, e.g. {"quantity": 5, "revenue": Decimal("49.95")}.
+    Measures are also readable as attributes (totals.revenue)."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
 
 
 @dataclass
 class ProcessingResult:
+    """Counts, status, and totals for one file.
+
+    Results are also readable under the names the summary uses, which
+    come from the schema: `by_<group_by>` (e.g. `by_product`) for the
+    per-group totals and `total_<measure>` (e.g. `total_revenue`) for
+    each grand total."""
+
     status: str
     valid_row_count: int
     rejected_row_count: int
-    total_revenue: Decimal
-    by_product: dict[str, ProductTotal] = field(default_factory=dict)
+    schema: Schema
+    totals: dict[str, int | Decimal] = field(default_factory=dict)
+    groups: dict[str, GroupTotals] = field(default_factory=dict)
+
+    def __getattr__(self, name: str) -> Any:
+        schema = self.__dict__.get("schema")
+        if schema is not None:
+            if name == f"by_{schema.group_by}":
+                return self.groups
+            if name.startswith("total_") and name[len("total_") :] in self.totals:
+                return self.totals[name[len("total_") :]]
+        raise AttributeError(name)
 
 
 class _CountingRawReader(io.RawIOBase):
@@ -151,7 +177,7 @@ def _normalize_header_name(name: str) -> str:
     return name.strip().lower()
 
 
-def _validate_header(header: list[str]) -> dict[str, int]:
+def _validate_header(header: list[str], schema: Schema) -> dict[str, int]:
     normalized = [_normalize_header_name(h) for h in header]
 
     seen: set[str] = set()
@@ -167,7 +193,7 @@ def _validate_header(header: list[str]) -> dict[str, int]:
         )
 
     column_index = {name: idx for idx, name in enumerate(normalized)}
-    missing = [c for c in REQUIRED_COLUMNS if c not in column_index]
+    missing = [c for c in schema.column_names if c not in column_index]
     if missing:
         raise MalformedCSVError(
             "missing_required_columns",
@@ -176,53 +202,58 @@ def _validate_header(header: list[str]) -> dict[str, int]:
     return column_index
 
 
+def _parse_value(column: Column, raw: str) -> tuple[Any, str | None]:
+    """Returns (value, rejection_reason) for one already-trimmed field.
+    The rejection codes are documented in schema.py."""
+    if column.type == "date":
+        if not _DATE_RE.match(raw):
+            return None, f"invalid_{column.name}"
+        try:
+            year, month, day = (int(p) for p in raw.split("-"))
+            datetime.date(year, month, day)
+        except ValueError:
+            return None, f"invalid_{column.name}"
+        return raw, None
+
+    if column.type == "string":
+        if column.required and not raw:
+            return None, f"empty_{column.name}"
+        return raw, None
+
+    if column.type == "integer":
+        pattern = _SIGNED_INTEGER_RE if column.signed else _UNSIGNED_INTEGER_RE
+        if not pattern.match(raw):
+            return None, f"invalid_{column.name}"
+        value = int(raw)
+        if column.positive and value <= 0:
+            return None, f"non_positive_{column.name}"
+        return value, None
+
+    # decimal
+    if raw.lower() in _NON_FINITE_TOKENS:
+        return None, f"non_finite_{column.name}"
+    if not _DECIMAL_RE.match(raw):
+        return None, f"invalid_{column.name}"
+    if column.non_negative and raw.startswith("-"):
+        return None, f"negative_{column.name}"
+    return Decimal(raw), None
+
+
 def _validate_row(
-    row: list[str], column_index: dict[str, int], header_len: int
-) -> tuple[str | None, int | None, Decimal | None, str | None]:
-    """Returns (product, quantity, unit_price, rejection_reason).
-
-    On success, rejection_reason is None and the other three are set.
-    On failure, rejection_reason is set and the other three may be None.
-    """
+    row: list[str], column_index: dict[str, int], header_len: int, schema: Schema
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Returns (values, rejection_reason): the parsed value of every
+    schema column on success, or the first failing column's reason."""
     if len(row) != header_len:
-        return None, None, None, "row_length_mismatch"
+        return None, "row_length_mismatch"
 
-    date_raw = row[column_index["date"]].strip()
-    product_raw = row[column_index["product"]].strip()
-    quantity_raw = row[column_index["quantity"]].strip()
-    unit_price_raw = row[column_index["unit_price"]].strip()
-
-    if not _DATE_RE.match(date_raw):
-        return None, None, None, "invalid_date"
-    try:
-        year, month, day = (int(p) for p in date_raw.split("-"))
-        datetime.date(year, month, day)
-    except ValueError:
-        return None, None, None, "invalid_date"
-
-    if not product_raw:
-        return None, None, None, "empty_product"
-
-    if not _QUANTITY_RE.match(quantity_raw):
-        return None, None, None, "invalid_quantity"
-    quantity = int(quantity_raw)
-    if quantity <= 0:
-        return None, None, None, "non_positive_quantity"
-
-    if unit_price_raw.lower() in _NON_FINITE_TOKENS:
-        return None, None, None, "non_finite_unit_price"
-    if _UNIT_PRICE_NEGATIVE_RE.match(unit_price_raw):
-        return None, None, None, "negative_unit_price"
-    if not _UNIT_PRICE_RE.match(unit_price_raw):
-        return None, None, None, "invalid_unit_price"
-    try:
-        unit_price = Decimal(unit_price_raw)
-    except Exception:
-        return None, None, None, "invalid_unit_price"
-    if not unit_price.is_finite():
-        return None, None, None, "non_finite_unit_price"
-
-    return product_raw, quantity, unit_price, None
+    values: dict[str, Any] = {}
+    for column in schema.columns:
+        value, reason = _parse_value(column, row[column_index[column.name]].strip())
+        if reason is not None:
+            return None, reason
+        values[column.name] = value
+    return values, None
 
 
 def process_csv(
@@ -230,6 +261,7 @@ def process_csv(
     rejected_csv_writer_target: TextIO,
     *,
     max_bytes: int = MAX_INPUT_BYTES,
+    schema: Schema | None = None,
 ) -> ProcessingResult:
     """Streams and validates a CSV file, writing rejected rows as it goes.
 
@@ -239,6 +271,7 @@ def process_csv(
     successfully. On MalformedCSVError / InputTooLargeError, whatever was
     written to it is incomplete and must be discarded by the caller.
     """
+    schema = schema or load_schema()
     try:
         text_stream = _open_text_stream(binary_stream, max_bytes)
         reader = csv.reader(text_stream)
@@ -247,7 +280,7 @@ def process_csv(
         except StopIteration:
             raise MalformedCSVError("empty_file", "CSV file is empty") from None
 
-        column_index = _validate_header(header)
+        column_index = _validate_header(header, schema)
         header_len = len(header)
 
         rejected_writer = csv.writer(rejected_csv_writer_target)
@@ -257,8 +290,10 @@ def process_csv(
 
         valid_row_count = 0
         rejected_row_count = 0
-        total_revenue = Decimal("0")
-        by_product: dict[str, ProductTotal] = {}
+        totals: dict[str, int | Decimal] = {
+            m.name: Decimal("0") if m.is_decimal else 0 for m in schema.measures if m.total
+        }
+        groups: dict[str, GroupTotals] = {}
 
         row_number = 0
         for row in reader:
@@ -268,9 +303,7 @@ def process_csv(
                 # treat it as an empty row rather than a length mismatch.
                 continue
 
-            product, quantity, unit_price, reason = _validate_row(
-                row, column_index, header_len
-            )
+            values, reason = _validate_row(row, column_index, header_len, schema)
 
             if reason is not None:
                 rejected_row_count += 1
@@ -278,18 +311,24 @@ def process_csv(
                 rejected_writer.writerow([*sanitized_row, row_number, reason])
                 continue
 
-            assert product is not None and quantity is not None and unit_price is not None
-            row_revenue = Decimal(quantity) * unit_price
+            assert values is not None
             valid_row_count += 1
-            total_revenue += row_revenue
-            existing = by_product.get(product)
+            row_measures = {}
+            for measure in schema.measures:
+                amount = 1
+                for column_name in measure.multiply:
+                    amount = amount * values[column_name]
+                row_measures[measure.name] = amount
+                if measure.total:
+                    totals[measure.name] += amount
+
+            group_key = values[schema.group_by]
+            existing = groups.get(group_key)
             if existing is None:
-                by_product[product] = ProductTotal(quantity=quantity, revenue=row_revenue)
+                groups[group_key] = GroupTotals(row_measures)
             else:
-                by_product[product] = ProductTotal(
-                    quantity=existing.quantity + quantity,
-                    revenue=existing.revenue + row_revenue,
-                )
+                for name, amount in row_measures.items():
+                    existing[name] += amount
     except UnicodeDecodeError as exc:
         raise MalformedCSVError("invalid_encoding", str(exc)) from exc
     except csv.Error as exc:
@@ -306,24 +345,29 @@ def process_csv(
         status=status,
         valid_row_count=valid_row_count,
         rejected_row_count=rejected_row_count,
-        total_revenue=total_revenue,
-        by_product=by_product,
+        schema=schema,
+        totals=totals,
+        groups=groups,
     )
 
 
+def _serialize_amount(value: int | Decimal) -> int | str:
+    return _decimal_to_str(value) if isinstance(value, Decimal) else value
+
+
 def build_summary_dict(result: ProcessingResult) -> dict:
-    return {
-        "total_revenue": _decimal_to_str(result.total_revenue),
+    schema = result.schema
+    summary: dict[str, Any] = {
         "valid_row_count": result.valid_row_count,
         "rejected_row_count": result.rejected_row_count,
-        "by_product": {
-            product: {
-                "quantity": totals.quantity,
-                "revenue": _decimal_to_str(totals.revenue),
-            }
-            for product, totals in sorted(result.by_product.items())
+        f"by_{schema.group_by}": {
+            key: {name: _serialize_amount(amount) for name, amount in measures.items()}
+            for key, measures in sorted(result.groups.items())
         },
     }
+    for name, amount in result.totals.items():
+        summary[f"total_{name}"] = _serialize_amount(amount)
+    return summary
 
 
 def summary_json_bytes(result: ProcessingResult) -> bytes:
