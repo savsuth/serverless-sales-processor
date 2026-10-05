@@ -497,6 +497,11 @@ AWS_PROFILE=<profile> python scripts/reprocess.py --status dead_lettered
 AWS_PROFILE=<profile> python scripts/reprocess.py --status completed --older-than-version 2 --dry-run
 ```
 
+If the profile comes from `aws login`, boto3 needs the optional
+`botocore[crt]` package to read it; otherwise export the session first
+with `eval "$(aws configure export-credentials --profile <profile> --format env)"`
+(`make smoke` does this for you).
+
 A reprocessed job overwrites its own outputs, so nothing is counted
 twice.
 

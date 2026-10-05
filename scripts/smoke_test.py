@@ -15,7 +15,9 @@ would be caught as a duplicate), then checks:
      email link redirects to the report.
 
 Reads `terraform output` from infra/; run with the deployment's AWS
-profile, e.g.  AWS_PROFILE=csv-pipeline python scripts/smoke_test.py
+profile, e.g.  AWS_PROFILE=csv-pipeline make smoke  (make exports the
+profile's credentials first: boto3 cannot read an `aws login` session
+without the optional botocore[crt] package).
 """
 
 from __future__ import annotations
@@ -181,9 +183,10 @@ def portal_checks(out: dict, s3, table, lambda_client, run_id: str) -> None:
     _, _, body = http("GET", f"{base}/jobs?{query}", token=token)
     job_id = json.loads(body).get("job_id", "")
     job = wait_for_job(table, job_id) if job_id else None
+    expected_status = local_reports(data)[0].status
     check(
         "portal upload is processed",
-        bool(job) and job["status"] == "completed",
+        bool(job) and job["status"] == expected_status,
         job["status"] if job else "timed out",
     )
     if not job:

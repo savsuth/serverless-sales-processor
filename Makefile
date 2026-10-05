@@ -59,5 +59,8 @@ plan: ## Plan for ENV into infra/tfplan (refuses if init points elsewhere)
 apply: ## Apply the plan file from `make plan` (nothing else)
 	$(TF) apply tfplan
 
+# boto3 cannot read an `aws login` session without botocore[crt], so an
+# AWS_PROFILE is turned into exported temporary credentials first.
 smoke: ## End-to-end test of the deployed stack (uploads real files)
+	@if [ -n "$$AWS_PROFILE" ]; then eval "$$(aws configure export-credentials --format env)"; unset AWS_PROFILE; fi; \
 	$(PY) scripts/smoke_test.py
