@@ -276,6 +276,26 @@ def _run_processing(
         except Exception as exc:  # noqa: BLE001 - unexpected processing failure
             return _fail(job_id, token, deps, error_code="processing_error", exc=exc)
 
+        # Only a file that produced totals is checked for duplicate
+        # content: re-running a failed file cannot double count anything.
+        if result.status in jobs.COMPLETED_STATUSES:
+            try:
+                content = deps.job_store.claim_content(result.content_sha256, job_id)
+            except Exception as exc:  # noqa: BLE001 - temporary AWS error
+                return _fail(job_id, token, deps, error_code="content_claim_error", exc=exc)
+            if content.status is jobs.ContentClaimStatus.DUPLICATE:
+                return _finish_duplicate(
+                    job_id,
+                    token,
+                    deps,
+                    duplicate_of=content.first_job_id,
+                    content_sha256=result.content_sha256,
+                )
+            if content.status is jobs.ContentClaimStatus.PENDING_ELSEWHERE:
+                return _wait_for_original(
+                    job_id, token, deps, original_job_id=content.first_job_id
+                )
+
         try:
             summary_bytes = summary_json_bytes(result)
             rejected_buffer.seek(0)
@@ -298,6 +318,7 @@ def _run_processing(
         rejected_row_count=result.rejected_row_count,
         error_code=result.error_code,
         error_message=result.error_message,
+        content_sha256=result.content_sha256,
     )
     if not owned:
         _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
@@ -341,6 +362,49 @@ def _finish_validation_failed(
     )
 
 
+def _finish_duplicate(
+    job_id: str, token: str, deps: Dependencies, *, duplicate_of: str, content_sha256: str
+) -> bool:
+    owned = deps.job_store.finalize_duplicate(
+        job_id, token, duplicate_of=duplicate_of, content_sha256=content_sha256
+    )
+    if not owned:
+        _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
+        return True
+
+    _log_info("duplicate_content_detected", job_id=job_id, duplicate_of=duplicate_of)
+    return _notify_and_ack(
+        job_id,
+        deps,
+        lease_owner=token,
+        status=jobs.STATUS_DUPLICATE_CONTENT,
+        valid_row_count=None,
+        rejected_row_count=None,
+        output_summary_key=None,
+        output_rejected_key=None,
+        error_code=None,
+        error_message=None,
+        duplicate_of=duplicate_of,
+    )
+
+
+def _wait_for_original(
+    job_id: str, token: str, deps: Dependencies, *, original_job_id: str
+) -> bool:
+    """Another job is processing the same content and hasn't finished.
+    Leave this message retryable: by a later delivery that job has
+    completed (this one then ends as a duplicate) or failed and is
+    itself being retried. Logged at INFO: waiting is not an error."""
+    deps.job_store.mark_failed(
+        job_id,
+        token,
+        error_code="waiting_for_original_job",
+        error_message=f"Same content as job {original_job_id}, which has not finished yet",
+    )
+    _log_info("duplicate_waiting_for_original_job", job_id=job_id, original_job_id=original_job_id)
+    return False
+
+
 def _fail(job_id: str, token: str, deps: Dependencies, *, error_code: str, exc: Exception) -> bool:
     deps.job_store.mark_failed(
         job_id, token, error_code=error_code, error_message=_describe_exception(exc)
@@ -371,6 +435,7 @@ def _ensure_notified(job_id: str, record: dict[str, Any], deps: Dependencies) ->
         output_rejected_key=record.get("output_rejected_key"),
         error_code=record.get("error_code"),
         error_message=record.get("error_message"),
+        duplicate_of=record.get("duplicate_of"),
     )
 
 
@@ -386,6 +451,7 @@ def _notify_and_ack(
     output_rejected_key: str | None,
     error_code: str | None,
     error_message: str | None,
+    duplicate_of: str | None = None,
 ) -> bool:
     subject, body = notifications.build_notification_message(
         job_id=job_id,
@@ -397,6 +463,7 @@ def _notify_and_ack(
         output_rejected_key=output_rejected_key,
         error_code=error_code,
         error_message=error_message,
+        duplicate_of=duplicate_of,
     )
     try:
         deps.notifier.publish(job_id=job_id, subject=subject, body=body)

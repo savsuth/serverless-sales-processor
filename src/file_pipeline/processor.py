@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import hashlib
 import io
 import re
 from dataclasses import dataclass, field
@@ -117,7 +118,10 @@ class ProcessingResult:
 
     `error_code` / `error_message` say why a structurally valid file is
     `validation_failed` (`no_valid_rows` or `rejection_rate_exceeded`);
-    both are None otherwise."""
+    both are None otherwise.
+
+    `content_sha256` is the SHA-256 of the file's exact bytes, used to
+    recognize the same content uploaded again (see jobs.claim_content)."""
 
     status: str
     valid_row_count: int
@@ -127,6 +131,7 @@ class ProcessingResult:
     groups: dict[str, GroupTotals] = field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None
+    content_sha256: str = ""
 
     def __getattr__(self, name: str) -> Any:
         schema = self.__dict__.get("schema")
@@ -141,12 +146,14 @@ class ProcessingResult:
 class _CountingRawReader(io.RawIOBase):
     """Wraps any object with .read(n) and enforces a byte ceiling while
     streaming, so an oversized or mislabeled input is caught mid-read
-    instead of only after being fully buffered."""
+    instead of only after being fully buffered. Also fingerprints the
+    bytes as they pass, so no second read is needed."""
 
     def __init__(self, source: IO[bytes], max_bytes: int) -> None:
         self._source = source
         self._max_bytes = max_bytes
         self._read_bytes = 0
+        self.sha256 = hashlib.sha256()
 
     def readable(self) -> bool:
         return True
@@ -157,6 +164,7 @@ class _CountingRawReader(io.RawIOBase):
             return 0
         n = len(data)
         b[:n] = data
+        self.sha256.update(data)
         self._read_bytes += n
         if self._read_bytes > self._max_bytes:
             raise InputTooLargeError(self._max_bytes)
@@ -173,8 +181,7 @@ def _decimal_to_str(value: Decimal) -> str:
     return format(value, "f")
 
 
-def _open_text_stream(binary_stream: IO[bytes], max_bytes: int) -> TextIO:
-    raw = _CountingRawReader(binary_stream, max_bytes)
+def _open_text_stream(raw: _CountingRawReader) -> TextIO:
     buffered = io.BufferedReader(raw)
     return io.TextIOWrapper(buffered, encoding="utf-8-sig", newline="")
 
@@ -278,8 +285,9 @@ def process_csv(
     written to it is incomplete and must be discarded by the caller.
     """
     schema = schema or load_schema()
+    raw = _CountingRawReader(binary_stream, max_bytes)
     try:
-        text_stream = _open_text_stream(binary_stream, max_bytes)
+        text_stream = _open_text_stream(raw)
         reader = csv.reader(text_stream)
         try:
             header = next(reader)
@@ -368,6 +376,7 @@ def process_csv(
         groups=groups,
         error_code=error_code,
         error_message=error_message,
+        content_sha256=raw.sha256.hexdigest(),
     )
 
 

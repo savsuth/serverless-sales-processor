@@ -1,5 +1,6 @@
 import csv
 import dataclasses
+import hashlib
 import io
 from decimal import Decimal
 
@@ -253,3 +254,9 @@ def test_schema_without_a_limit_accepts_any_rejection_rate():
     binary = io.BytesIO(csv_text.encode("utf-8"))
     result = process_csv(binary, io.StringIO(), schema=schema)
     assert result.status == "completed_with_rejections"
+
+
+def test_content_fingerprint_is_the_sha256_of_the_exact_bytes():
+    data = VALID_CSV.encode("utf-8")
+    result = process_csv(io.BytesIO(data), io.StringIO())
+    assert result.content_sha256 == hashlib.sha256(data).hexdigest()
