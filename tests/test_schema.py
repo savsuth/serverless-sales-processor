@@ -2,6 +2,7 @@ import copy
 import csv
 import io
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -165,3 +166,13 @@ def _broken(change):
 def test_invalid_schemas_are_rejected(schema):
     with pytest.raises(SchemaError):
         parse_schema(schema)
+
+
+def test_bundled_sales_schema_allows_at_most_half_the_rows_rejected():
+    assert load_schema().max_rejection_rate == Decimal("0.5")
+
+
+@pytest.mark.parametrize("rate", [-0.1, 1.5, "0.5", True])
+def test_invalid_max_rejection_rate_is_rejected(rate):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "max_rejection_rate": rate})

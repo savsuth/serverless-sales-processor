@@ -296,6 +296,8 @@ def _run_processing(
         output_rejected_key=rejected_key,
         valid_row_count=result.valid_row_count,
         rejected_row_count=result.rejected_row_count,
+        error_code=result.error_code,
+        error_message=result.error_message,
     )
     if not owned:
         _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
@@ -310,8 +312,8 @@ def _run_processing(
         rejected_row_count=result.rejected_row_count,
         output_summary_key=summary_key,
         output_rejected_key=rejected_key,
-        error_code=None,
-        error_message=None,
+        error_code=result.error_code,
+        error_message=result.error_message,
     )
 
 

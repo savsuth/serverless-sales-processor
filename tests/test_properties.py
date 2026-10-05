@@ -134,6 +134,9 @@ def _process(rows: list[Row]):
 def _expected_status(valid_count: int, rejected_count: int) -> str:
     if valid_count == 0:
         return "validation_failed"
+    # The sales schema fails a file when more than half its rows are rejected.
+    if rejected_count / (valid_count + rejected_count) > 0.5:
+        return "validation_failed"
     return "completed" if rejected_count == 0 else "completed_with_rejections"
 
 

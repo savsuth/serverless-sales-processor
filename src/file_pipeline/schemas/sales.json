@@ -12,5 +12,6 @@
       { "name": "quantity", "multiply": ["quantity"] },
       { "name": "revenue", "multiply": ["quantity", "unit_price"], "total": true }
     ]
-  }
+  },
+  "max_rejection_rate": 0.5
 }

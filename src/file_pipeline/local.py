@@ -35,7 +35,7 @@ from file_pipeline.schema import DEFAULT_SCHEMA, Schema, SchemaError, load_schem
 # "validation_failed" are both terminal here, just with different causes.
 EXIT_OK = 0
 EXIT_FILE_REJECTED = 1  # malformed CSV or input exceeds the size limit
-EXIT_VALIDATION_FAILED = 2  # well-formed CSV, but zero valid rows
+EXIT_VALIDATION_FAILED = 2  # well-formed CSV, but zero valid rows or too many rejected
 
 
 def run(
@@ -95,6 +95,8 @@ def run(
     )
     print(f"wrote {summary_path}")
     print(f"wrote {rejected_path}")
+    if result.error_code:
+        print(f"validation_failed: {result.error_code}: {result.error_message}", file=sys.stderr)
 
     return EXIT_VALIDATION_FAILED if result.status == "validation_failed" else EXIT_OK
 

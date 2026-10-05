@@ -197,32 +197,46 @@ class JobStore:
         output_rejected_key: str,
         valid_row_count: int,
         rejected_row_count: int,
+        error_code: str | None = None,
+        error_message: str | None = None,
     ) -> bool:
+        """Records a run that produced reports. `error_code` is set when
+        the file still failed validation (no valid rows, or too many
+        rejected ones); otherwise any error from an earlier failed
+        attempt is cleared."""
         from boto3.dynamodb.conditions import Attr
+
+        values = {
+            ":status": status,
+            ":updated_at": _now_iso(),
+            ":summary_key": output_summary_key,
+            ":rejected_key": output_rejected_key,
+            ":valid_count": valid_row_count,
+            ":rejected_count": rejected_row_count,
+            ":notif_pending": NOTIFICATION_PENDING,
+        }
+        update_expression = (
+            "SET #status = :status, updated_at = :updated_at, "
+            "output_summary_key = :summary_key, "
+            "output_rejected_key = :rejected_key, "
+            "valid_row_count = :valid_count, "
+            "rejected_row_count = :rejected_count, "
+            "notification_status = :notif_pending"
+        )
+        if error_code is None:
+            update_expression += " REMOVE error_code, error_message"
+        else:
+            update_expression += ", error_code = :error_code, error_message = :error_message"
+            values[":error_code"] = error_code
+            values[":error_message"] = sanitize_error_message(error_message or "")
 
         try:
             self._table.update_item(
                 Key={"job_id": job_id},
-                UpdateExpression=(
-                    "SET #status = :status, updated_at = :updated_at, "
-                    "output_summary_key = :summary_key, "
-                    "output_rejected_key = :rejected_key, "
-                    "valid_row_count = :valid_count, "
-                    "rejected_row_count = :rejected_count, "
-                    "notification_status = :notif_pending "
-                    "REMOVE error_code, error_message"
-                ),
+                UpdateExpression=update_expression,
                 ConditionExpression=Attr("lease_owner").eq(token),
                 ExpressionAttributeNames={"#status": "status"},
-                ExpressionAttributeValues={
-                    ":status": status,
-                    ":updated_at": _now_iso(),
-                    ":summary_key": output_summary_key,
-                    ":rejected_key": output_rejected_key,
-                    ":valid_count": valid_row_count,
-                    ":rejected_count": rejected_row_count,
-                    ":notif_pending": NOTIFICATION_PENDING,
-                },
+                ExpressionAttributeValues=values,
             )
             return True
         except ClientError as exc:

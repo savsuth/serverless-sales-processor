@@ -23,7 +23,8 @@ Shape of a schema file:
           {"name": "quantity", "multiply": ["quantity"]},
           {"name": "revenue", "multiply": ["quantity", "unit_price"], "total": true}
         ]
-      }
+      },
+      "max_rejection_rate": 0.5
     }
 
 Column types and their options:
@@ -42,12 +43,18 @@ Columns are checked in the order listed and the first failure is the
 row's rejection reason. Each measure adds up, over every valid row, the
 product of the listed numeric columns, per value of the `group_by`
 column; `total: true` also reports a grand total as `total_<name>`.
+
+`max_rejection_rate` (optional, 0 to 1) fails a file whose share of
+rejected rows is strictly above it, even though some rows were valid:
+its reports are still written, but its status is `validation_failed`.
+Omit it to accept any share of rejected rows.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import cache
 from importlib import resources
 from pathlib import Path
@@ -93,6 +100,7 @@ class Schema:
     columns: tuple[Column, ...]
     group_by: str
     measures: tuple[Measure, ...]
+    max_rejection_rate: Decimal | None = None
 
     @property
     def column_names(self) -> tuple[str, ...]:
@@ -117,7 +125,9 @@ def _load_bundled(name: str) -> Schema:
 
 
 def parse_schema(data: dict[str, Any]) -> Schema:
-    _require_keys(data, "schema", required={"name", "columns", "aggregation"})
+    _require_keys(
+        data, "schema", required={"name", "columns", "aggregation"}, optional={"max_rejection_rate"}
+    )
     name = data["name"]
     if not isinstance(name, str) or not name:
         raise SchemaError("schema name must be a non-empty string")
@@ -142,7 +152,25 @@ def parse_schema(data: dict[str, Any]) -> Schema:
     if len({m.name for m in measures}) != len(measures):
         raise SchemaError("measure names must be unique")
 
-    return Schema(name=name, columns=columns, group_by=group_by, measures=measures)
+    return Schema(
+        name=name,
+        columns=columns,
+        group_by=group_by,
+        measures=measures,
+        max_rejection_rate=_parse_rate(data.get("max_rejection_rate")),
+    )
+
+
+def _parse_rate(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    # bool is an int subclass in Python; `true` is not a rate.
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise SchemaError(f"max_rejection_rate must be a number from 0 to 1: {value!r}")
+    rate = Decimal(str(value))
+    if not 0 <= rate <= 1:
+        raise SchemaError(f"max_rejection_rate must be a number from 0 to 1: {value!r}")
+    return rate
 
 
 def _parse_column(data: dict[str, Any]) -> Column:

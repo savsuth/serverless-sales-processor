@@ -1,0 +1,15 @@
+{
+  "by_product": {
+    "Gadget": {
+      "quantity": 1,
+      "revenue": "19.50"
+    },
+    "Widget": {
+      "quantity": 2,
+      "revenue": "19.98"
+    }
+  },
+  "rejected_row_count": 3,
+  "total_revenue": "39.48",
+  "valid_row_count": 2
+}

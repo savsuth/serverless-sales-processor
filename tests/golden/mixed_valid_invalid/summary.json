@@ -1,15 +1,19 @@
 {
   "by_product": {
+    "Gadget": {
+      "quantity": 3,
+      "revenue": "58.50"
+    },
     "Gizmo": {
-      "quantity": 10,
-      "revenue": "22.50"
+      "quantity": 20,
+      "revenue": "45.00"
     },
     "Widget": {
-      "quantity": 3,
-      "revenue": "29.97"
+      "quantity": 11,
+      "revenue": "109.89"
     }
   },
   "rejected_row_count": 8,
-  "total_revenue": "52.47",
-  "valid_row_count": 2
+  "total_revenue": "213.39",
+  "valid_row_count": 9
 }

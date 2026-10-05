@@ -566,3 +566,41 @@ def test_logs_are_pure_json_and_never_contain_csv_contents(aws_stack, capsys):
     assert all({"level", "message"} <= entry.keys() for entry in parsed)
     joined = "\n".join(lines)
     assert "Widget" not in joined and "9.99" not in joined
+
+
+# --- Rejection-rate threshold ---
+
+HIGH_REJECTION_CSV = (
+    b"date,product,quantity,unit_price\n"
+    b"2024-01-05,Widget,3,9.99\nbad-date,X,1,1.00\n2024-01-06,,1,1.00\n"
+)
+
+
+def test_too_many_rejected_rows_fails_the_job_but_writes_reports(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", HIGH_REJECTION_CSV)
+    notifier = FakeNotifier()
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+
+    result = handler.handle_event(event, make_deps(aws_stack, notifier=notifier))
+
+    assert result == {"batchItemFailures": []}
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    job = get_job(aws_stack, job_id)
+    assert job["status"] == "validation_failed"
+    assert job["error_code"] == "rejection_rate_exceeded"
+    assert job["error_message"] == "2 of 3 rows rejected (66.7%), above the 50% limit"
+    assert job["output_summary_key"] == f"reports/{job_id}/summary.json"
+    (_, _, body), = notifier.calls
+    assert "Error code: rejection_rate_exceeded" in body
+    assert "Summary report: s3://" in body
+
+
+def test_completed_job_has_no_error_code(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", MIXED_CSV)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+
+    handler.handle_event(event, make_deps(aws_stack, notifier=FakeNotifier()))
+
+    job = get_job(aws_stack, jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id))
+    assert job["status"] == "completed_with_rejections"
+    assert "error_code" not in job

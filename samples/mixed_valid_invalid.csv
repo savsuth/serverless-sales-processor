@@ -9,3 +9,10 @@ date,product,quantity,unit_price
 2024-01-06,Gadget,2,not-a-price
 2024-01-07,=SUM(A1:A9),bad,1.00
 2024-01-07,Gizmo,10,2.25
+2024-01-08,Widget,1,9.99
+2024-01-08,Gadget,2,19.50
+2024-01-09,Gizmo,4,2.25
+2024-01-09,Widget,2,9.99
+2024-01-10,Gadget,1,19.50
+2024-01-10,Gizmo,6,2.25
+2024-01-11,Widget,5,9.99

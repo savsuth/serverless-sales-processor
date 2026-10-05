@@ -113,7 +113,11 @@ class ProcessingResult:
     Results are also readable under the names the summary uses, which
     come from the schema: `by_<group_by>` (e.g. `by_product`) for the
     per-group totals and `total_<measure>` (e.g. `total_revenue`) for
-    each grand total."""
+    each grand total.
+
+    `error_code` / `error_message` say why a structurally valid file is
+    `validation_failed` (`no_valid_rows` or `rejection_rate_exceeded`);
+    both are None otherwise."""
 
     status: str
     valid_row_count: int
@@ -121,6 +125,8 @@ class ProcessingResult:
     schema: Schema
     totals: dict[str, int | Decimal] = field(default_factory=dict)
     groups: dict[str, GroupTotals] = field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
 
     def __getattr__(self, name: str) -> Any:
         schema = self.__dict__.get("schema")
@@ -334,8 +340,20 @@ def process_csv(
     except csv.Error as exc:
         raise MalformedCSVError("csv_parse_error", str(exc)) from exc
 
+    error_code = error_message = None
+    row_count = valid_row_count + rejected_row_count
+    limit = schema.max_rejection_rate
     if valid_row_count == 0:
         status = STATUS_VALIDATION_FAILED
+        error_code, error_message = "no_valid_rows", "No row passed validation"
+    elif limit is not None and rejected_row_count > limit * row_count:
+        status = STATUS_VALIDATION_FAILED
+        error_code = "rejection_rate_exceeded"
+        error_message = (
+            f"{rejected_row_count} of {row_count} rows rejected "
+            f"({_percent(Decimal(rejected_row_count) / row_count)}), "
+            f"above the {_percent(limit)} limit"
+        )
     elif rejected_row_count == 0:
         status = STATUS_COMPLETED
     else:
@@ -348,7 +366,14 @@ def process_csv(
         schema=schema,
         totals=totals,
         groups=groups,
+        error_code=error_code,
+        error_message=error_message,
     )
+
+
+def _percent(rate: Decimal) -> str:
+    """0.5 -> "50%", 0.125 -> "12.5%", 2/3 -> "66.7%"."""
+    return _decimal_to_str(round(rate * 100, 1).normalize()) + "%"
 
 
 def _serialize_amount(value: int | Decimal) -> int | str:
