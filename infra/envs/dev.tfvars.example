@@ -1,0 +1,9 @@
+# Copy to dev.tfvars (gitignored). A full second copy of the stack whose
+# resource names all start with project_name, so it never collides with
+# prod. infra/terraform.tfvars (if present) is also loaded, so set here
+# anything that must differ from it.
+project_name           = "csv-sales-pipeline-dev"
+environment            = "dev"
+lambda_max_concurrency = 2
+log_retention_days     = 7
+enable_budget_alert    = false

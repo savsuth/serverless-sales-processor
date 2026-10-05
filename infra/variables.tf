@@ -4,6 +4,12 @@ variable "project_name" {
   default     = "csv-sales-pipeline"
 }
 
+variable "environment" {
+  description = "Environment name, applied as the Environment tag on every resource (cost reports can split by it). See infra/envs/README.md."
+  type        = string
+  default     = "prod"
+}
+
 variable "aws_region" {
   description = "Region for every resource. The S3 bucket and its SQS notification queue must share a region, so this is the single region for the whole stack. Defaults to us-east-2: this AWS account has an organization-level Service Control Policy (AdvancedModeRegionRestrictionSecurityControlPolicy) that funnels general workloads to us-east-2 and denies most S3/EC2/DynamoDB/Lambda actions in us-east-1 and us-west-2. Override only if your account doesn't have that restriction."
   type        = string

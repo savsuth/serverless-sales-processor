@@ -1,0 +1,5 @@
+# Copy to dev.backend.hcl (gitignored). Same state bucket as prod, but a
+# separate state file, so the dev stack can never touch prod's resources.
+bucket = "csv-sales-pipeline-tfstate-<ACCOUNT_ID>"
+key    = "csv-sales-pipeline-dev/terraform.tfstate"
+region = "us-east-2"

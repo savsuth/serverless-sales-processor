@@ -3,8 +3,9 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Project   = "csv-sales-pipeline"
-      ManagedBy = "terraform"
+      Project     = "csv-sales-pipeline"
+      Environment = var.environment
+      ManagedBy   = "terraform"
     }
   }
 }

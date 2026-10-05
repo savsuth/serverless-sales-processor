@@ -40,9 +40,11 @@ infra/lambda/*.zip
 
 # Terraform backend + variable files (account-specific; commit the *.example)
 infra/**/backend.hcl
+infra/**/*.backend.hcl
 infra/**/*.tfvars
 infra/**/*.tfvars.json
 !infra/**/*.tfvars.example
 
 # Hypothesis example database
 .hypothesis/
+!infra/**/*.backend.hcl.example
