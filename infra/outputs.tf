@@ -56,3 +56,8 @@ output "athena_table_name" {
   description = "Curated table: one row per valid source CSV row of every completed job, partitioned by month."
   value       = try(aws_glue_catalog_table.curated[0].name, null)
 }
+
+output "job_status_index_name" {
+  description = "DynamoDB index for listing jobs by status (scripts/list_jobs.sh)."
+  value       = "status-created_at-index"
+}
