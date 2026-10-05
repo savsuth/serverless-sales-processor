@@ -34,7 +34,7 @@ variable "github_repository" {
 }
 
 variable "github_environment" {
-  description = "GitHub Environment whose jobs may assume the deploy role. Configure required reviewers and a deployment-branch rule (main only) on that Environment: GitHub puts the environment, not the branch, in the OIDC subject claim for jobs that use one."
+  description = "GitHub Environment whose jobs may assume the deploy role. Configure required reviewers and a deployment-branch rule (master only) on that Environment: GitHub puts the environment, not the branch, in the OIDC subject claim for jobs that use one."
   type        = string
   default     = "production"
 }

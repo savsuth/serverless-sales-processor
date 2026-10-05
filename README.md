@@ -45,7 +45,7 @@ Terraform configuration used to deploy the AWS stack.
 - Snapshot tests that pin every sample's exact output bytes, and
   property-based tests (Hypothesis) that check invariants over thousands
   of generated files.
-- GitHub Actions workflow for linting and tests on pushes to `main` and on
+- GitHub Actions workflow for linting and tests on pushes to `master` and on
   every pull request, and a separate, manually triggered workflow for
   deployment.
 - Design decisions recorded in [`docs/decisions/`](docs/decisions/).

@@ -5,7 +5,7 @@ name: Deploy infrastructure
 #   1. infra/bootstrap applied once from a laptop (creates the state bucket
 #      and, with enable_github_oidc = true, the deploy role).
 #   2. A GitHub Environment named "production" with required reviewers AND
-#      a deployment-branch rule restricting it to main. The role's trust
+#      a deployment-branch rule restricting it to master. The role's trust
 #      policy trusts exactly repo:OWNER/REPO:environment:production.
 #   3. Repository/environment *variables* (not secrets -- a role ARN,
 #      region, and bucket name are not sensitive): AWS_DEPLOY_ROLE_ARN,
