@@ -57,6 +57,16 @@ data "aws_iam_policy_document" "lambda_permissions" {
     resources = [aws_dynamodb_table.jobs.arn]
   }
 
+  dynamic "statement" {
+    for_each = var.enable_events ? [1] : []
+    content {
+      sid       = "PublishJobEvents"
+      effect    = "Allow"
+      actions   = ["events:PutEvents"]
+      resources = ["arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:event-bus/default"]
+    }
+  }
+
   statement {
     sid       = "PublishJobNotifications"
     effect    = "Allow"

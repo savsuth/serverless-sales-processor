@@ -1031,3 +1031,82 @@ def test_no_metrics_when_another_worker_has_taken_over(aws_stack, capsys):
     handler.handle_event(event, make_deps(aws_stack, object_storage=slow))
 
     assert _metric_lines(capsys) == []
+
+
+# --- EventBridge events ---
+
+
+class FakeEvents:
+    def __init__(self, fail_times: int = 0):
+        self.events: list[tuple[str, dict]] = []
+        self._fail_times = fail_times
+
+    def publish(self, *, detail_type, detail):
+        self.events.append((detail_type, detail))
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            raise RuntimeError("simulated EventBridge failure")
+
+
+def test_finished_job_publishes_an_event_with_its_source_file(aws_stack):
+    version_id = upload(aws_stack["s3"], "q1/sales.csv", MIXED_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "q1/sales.csv", version_id)
+    deps = make_deps(aws_stack, notifier=FakeNotifier())
+    deps.events = FakeEvents()
+
+    handler.handle_event(
+        {"Records": [sqs_record(s3_event(INPUT_BUCKET, "q1/sales.csv", version_id))]}, deps
+    )
+
+    ((detail_type, detail),) = deps.events.events
+    assert detail_type == "CSV job finished"
+    assert detail == {
+        "job_id": job_id,
+        "status": "completed_with_rejections",
+        "valid_row_count": 1,
+        "rejected_row_count": 1,
+        "error_code": None,
+        "duplicate_of": None,
+        "warning_counts": {"duplicate_rows": 0, "outliers": 0},
+        "output_bucket": OUTPUT_BUCKET,
+        "summary_key": f"reports/{job_id}/summary.json",
+        "rejected_key": f"reports/{job_id}/rejected_rows.csv",
+        "source_bucket": INPUT_BUCKET,
+        "source_key": "q1/sales.csv",
+        "source_version_id": version_id,
+    }
+
+
+def test_event_failure_is_retried_with_the_notification(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+    deps = make_deps(aws_stack, notifier=FakeNotifier())
+    deps.events = FakeEvents(fail_times=1)
+
+    assert handler.handle_event(event, deps) == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+    assert get_job(aws_stack, job_id)["notification_status"] == "failed"
+    assert handler.handle_event(event, deps) == {"batchItemFailures": []}
+    assert [d["status"] for _, d in deps.events.events] == ["completed", "completed"]
+    assert get_job(aws_stack, job_id)["notification_status"] == "sent"
+
+
+def test_dead_lettered_job_publishes_an_event(aws_stack, monkeypatch):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    monkeypatch.setattr(handler, "process_csv", lambda *a, **k: 1 / 0)
+    deps = make_deps(aws_stack, notifier=FakeNotifier())
+    deps.events = FakeEvents()
+
+    handler.handle_event(
+        {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}, deps
+    )
+
+    ((detail_type, detail),) = deps.events.events
+    assert detail_type == "CSV job dead-lettered"
+    assert (detail["error_code"], detail["in_dead_letter_queue"]) == ("processing_error", False)
+
+
+def test_event_publisher_sends_to_eventbridge(aws_stack):
+    events_client = boto3.client("events", region_name=REGION)
+    publisher = notifications.EventPublisher(events_client, "default", "csv-sales-pipeline")
+    publisher.publish(detail_type="CSV job finished", detail={"job_id": "x", "status": "completed"})

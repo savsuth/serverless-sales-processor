@@ -17,6 +17,7 @@ notification retries are gated on the job already being terminal.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 _WARNING_LABELS = {"duplicate_rows": "repeated row", "outliers": "unusual value"}
@@ -93,3 +94,30 @@ class SNSNotifier:
                 "job_id": {"DataType": "String", "StringValue": job_id},
             },
         )
+
+
+class EventPublisher:
+    """Publishes job outcomes to an EventBridge bus, so other systems can
+    subscribe to exactly the outcomes they care about (for example only
+    validation_failed) with an EventBridge rule. Delivery is at least once,
+    like the SNS notification it accompanies."""
+
+    def __init__(self, events_client: Any, bus_name: str, source: str) -> None:
+        self._events = events_client
+        self._bus_name = bus_name
+        self._source = source
+
+    def publish(self, *, detail_type: str, detail: dict[str, Any]) -> None:
+        response = self._events.put_events(
+            Entries=[
+                {
+                    "EventBusName": self._bus_name,
+                    "Source": self._source,
+                    "DetailType": detail_type,
+                    "Detail": json.dumps(detail),
+                }
+            ]
+        )
+        if response.get("FailedEntryCount"):
+            code = response["Entries"][0].get("ErrorCode", "Unknown")
+            raise RuntimeError(f"EventBridge rejected the event: {code}")

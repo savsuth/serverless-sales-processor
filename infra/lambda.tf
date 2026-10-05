@@ -43,6 +43,8 @@ resource "aws_lambda_function" "processor" {
       SCHEMA_NAME            = var.schema_name
       MAX_RECEIVE_COUNT      = tostring(var.sqs_max_receive_count)
       METRICS_NAMESPACE      = local.metrics_namespace
+      EVENT_BUS_NAME         = var.enable_events ? "default" : ""
+      EVENT_SOURCE           = var.project_name
       LOG_LEVEL              = "INFO"
     }
   }

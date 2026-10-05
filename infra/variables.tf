@@ -120,6 +120,12 @@ variable "log_retention_days" {
 
 # --- Notifications -----------------------------------------------------
 
+variable "enable_events" {
+  description = "Publish a \"CSV job finished\" / \"CSV job dead-lettered\" event to the account's default EventBridge bus for every job outcome, so other systems can subscribe with an EventBridge rule (source = project_name)."
+  type        = bool
+  default     = true
+}
+
 variable "notification_email" {
   description = "Optional email address to subscribe to the SNS notification topic (job completion + alarms). Leave empty to create the topic without a subscription and add one later. AWS requires the recipient to confirm the subscription (a confirmation email is sent) before delivery starts."
   type        = string

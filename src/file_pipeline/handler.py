@@ -150,6 +150,7 @@ class Dependencies:
     # this receive count is the last one before the dead-letter queue.
     max_receive_count: int = 5
     metrics_namespace: str = "CsvSalesPipeline"
+    events: notifications.EventPublisher | None = None
 
 
 def _default_dependencies() -> Dependencies:
@@ -160,6 +161,14 @@ def _default_dependencies() -> Dependencies:
     lease_seconds = int(os.environ.get("LEASE_SECONDS", jobs.DEFAULT_LEASE_SECONDS))
 
     schema = load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA))
+    bus_name = os.environ.get("EVENT_BUS_NAME", "")
+    events = (
+        notifications.EventPublisher(
+            boto3.client("events"), bus_name, os.environ.get("EVENT_SOURCE", "csv-sales-pipeline")
+        )
+        if bus_name
+        else None
+    )
 
     return Dependencies(
         job_store=jobs.JobStore(
@@ -174,6 +183,7 @@ def _default_dependencies() -> Dependencies:
         schema=schema,
         max_receive_count=int(os.environ.get("MAX_RECEIVE_COUNT", 5)),
         metrics_namespace=os.environ.get("METRICS_NAMESPACE", "CsvSalesPipeline"),
+        events=events,
     )
 
 
@@ -493,6 +503,10 @@ def _run_processing(
     )
 
 
+def _int_or_none(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
 def _warning_counts(warnings: dict[str, Any]) -> dict[str, int]:
     return {name: warning["count"] for name, warning in warnings.items()}
 
@@ -647,7 +661,40 @@ def _dead_letter(
         deps.notifier.publish(job_id=job_id, subject=subject, body=body)
     except Exception as exc:  # noqa: BLE001 - best effort; the job record and alarm remain
         _log_error("sns_publish_failed", job_id=job_id, error=type(exc).__name__)
+    try:
+        _publish_event(
+            deps,
+            job_id,
+            detail_type="CSV job dead-lettered",
+            detail={
+                "status": jobs.STATUS_DEAD_LETTERED,
+                "error_code": error_code,
+                "in_dead_letter_queue": in_queue,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort, as above
+        _log_error("event_publish_failed", job_id=job_id, error=type(exc).__name__)
     return not in_queue
+
+
+def _publish_event(
+    deps: Dependencies, job_id: str, *, detail_type: str, detail: dict[str, Any]
+) -> None:
+    """Publishes to EventBridge, if enabled, adding the job's source file
+    (read from the job record) so subscribers need no lookup."""
+    if deps.events is None:
+        return
+    record = deps.job_store.get(job_id) or {}
+    deps.events.publish(
+        detail_type=detail_type,
+        detail={
+            "job_id": job_id,
+            **detail,
+            "source_bucket": record.get("source_bucket"),
+            "source_key": record.get("source_key"),
+            "source_version_id": record.get("source_version_id"),
+        },
+    )
 
 
 def _ensure_notified(job_id: str, record: dict[str, Any], deps: Dependencies) -> bool:
@@ -709,6 +756,28 @@ def _notify_and_ack(
         deps.notifier.publish(job_id=job_id, subject=subject, body=body)
     except Exception as exc:  # noqa: BLE001
         _log_error("sns_publish_failed", job_id=job_id, error=type(exc).__name__)
+        deps.job_store.mark_notification_result(job_id, lease_owner, sent=False)
+        return False
+
+    try:
+        _publish_event(
+            deps,
+            job_id,
+            detail_type="CSV job finished",
+            detail={
+                "status": status,
+                "valid_row_count": _int_or_none(valid_row_count),
+                "rejected_row_count": _int_or_none(rejected_row_count),
+                "error_code": error_code,
+                "duplicate_of": duplicate_of,
+                "warning_counts": {k: int(v) for k, v in (warning_counts or {}).items()},
+                "output_bucket": deps.output_bucket if output_summary_key else None,
+                "summary_key": output_summary_key,
+                "rejected_key": output_rejected_key,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - retried with the notification
+        _log_error("event_publish_failed", job_id=job_id, error=type(exc).__name__)
         deps.job_store.mark_notification_result(job_id, lease_owner, sent=False)
         return False
 
