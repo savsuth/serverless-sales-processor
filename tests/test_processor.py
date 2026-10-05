@@ -312,3 +312,14 @@ def test_unknown_separator_fails_with_missing_columns():
     with pytest.raises(MalformedCSVError) as exc_info:
         _run("date|product|quantity|unit_price\n2024-01-01|Widget|1|1.00\n")
     assert exc_info.value.code == "missing_required_columns"
+
+
+def test_product_names_differing_only_in_case_are_one_product():
+    csv_text = (
+        "date,product,quantity,unit_price\n"
+        "2024-01-01,Widget,1,1.00\n2024-01-02,widget,2,1.00\n2024-01-03,WIDGET ,3,1.00\n"
+    )
+    result, _ = _run(csv_text)
+    summary = build_summary_dict(result)
+    # Reported under the alphabetically first spelling, whatever the row order.
+    assert summary["by_product"] == {"WIDGET": {"quantity": 6, "revenue": "6.00"}}

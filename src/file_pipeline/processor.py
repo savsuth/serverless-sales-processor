@@ -362,7 +362,13 @@ def process_csv(
         totals: dict[str, int | Decimal] = {
             m.name: Decimal("0") if m.is_decimal else 0 for m in schema.measures if m.total
         }
-        groups: dict[str, GroupTotals] = {}
+        # Groups are keyed by the value as compared (lowercased for a
+        # case_insensitive column, matching Athena's lower()) and reported
+        # under the alphabetically first spelling, so row order never
+        # changes the report.
+        group_case_insensitive = schema.column(schema.group_by).case_insensitive
+        groups_by_key: dict[str, GroupTotals] = {}
+        group_names: dict[str, str] = {}
 
         row_number = 0
         for row in reader:
@@ -390,13 +396,16 @@ def process_csv(
                 row_measures[measure.name] = amount
                 if measure.total:
                     totals[measure.name] += amount
+            group_value = values[schema.group_by]
+            group_key = group_value.lower() if group_case_insensitive else group_value
+            group_names[group_key] = min(group_names.get(group_key, group_value), group_value)
+
             if on_valid_row is not None:
                 on_valid_row(row_number, values, row_measures)
 
-            group_key = values[schema.group_by]
-            existing = groups.get(group_key)
+            existing = groups_by_key.get(group_key)
             if existing is None:
-                groups[group_key] = GroupTotals(row_measures)
+                groups_by_key[group_key] = GroupTotals(row_measures)
             else:
                 for name, amount in row_measures.items():
                     existing[name] += amount
@@ -434,7 +443,7 @@ def process_csv(
         rejected_row_count=rejected_row_count,
         schema=schema,
         totals=totals,
-        groups=groups,
+        groups={group_names[key]: totals_ for key, totals_ in groups_by_key.items()},
         error_code=error_code,
         error_message=error_message,
         content_sha256=raw.sha256.hexdigest(),

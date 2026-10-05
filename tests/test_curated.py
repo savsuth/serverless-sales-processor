@@ -119,3 +119,13 @@ def test_measures_named_after_a_column_are_not_repeated():
         "job_id",
         "source_row_number",
     ]
+
+
+def test_curated_rows_keep_each_rows_own_spelling():
+    csv_text = (
+        "date,product,quantity,unit_price\n"
+        "2024-01-01,Widget,1,1.00\n2024-01-02,wIdGeT,1,2.00\n"
+    )
+    files = _curated_files(csv_text)
+    (body,) = files.values()
+    assert [row["product"] for row in read_curated_file(body)] == ["Widget", "wIdGeT"]

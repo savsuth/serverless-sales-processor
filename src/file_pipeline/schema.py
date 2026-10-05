@@ -31,7 +31,12 @@ Column types and their options:
 
 * `date`: `YYYY-MM-DD`, a real calendar date. Rejection: `invalid_<name>`.
 * `string`: any text, trimmed. `required` rejects an empty value
-  (`empty_<name>`).
+  (`empty_<name>`). `case_insensitive` treats values that differ only
+  in letter case as the same value when grouping and when spotting
+  duplicate rows. Reports show the alphabetically first spelling, so row
+  order never changes a report; curated rows keep each row's own
+  spelling, and `GROUP BY lower(col)` with `min(col)` in Athena gives the
+  same grouping.
 * `integer`: digits only, no sign unless `signed`. `positive` rejects
   zero and below (`non_positive_<name>`). Otherwise `invalid_<name>`.
 * `decimal`: plain decimal notation, no exponent. `NaN`/`Infinity`
@@ -80,7 +85,7 @@ DEFAULT_SCHEMA = "sales"
 
 COLUMN_OPTIONS = {
     "date": frozenset(),
-    "string": frozenset({"required"}),
+    "string": frozenset({"required", "case_insensitive"}),
     "integer": frozenset({"positive", "signed"}),
     "decimal": frozenset({"non_negative"}),
 }
@@ -101,6 +106,7 @@ class Column:
     name: str
     type: str
     required: bool = False
+    case_insensitive: bool = False
     positive: bool = False
     signed: bool = False
     non_negative: bool = False
@@ -127,6 +133,9 @@ class Schema:
     @property
     def column_names(self) -> tuple[str, ...]:
         return tuple(c.name for c in self.columns)
+
+    def column(self, name: str) -> Column:
+        return next(c for c in self.columns if c.name == name)
 
 
 def load_schema(name_or_path: str = DEFAULT_SCHEMA) -> Schema:
