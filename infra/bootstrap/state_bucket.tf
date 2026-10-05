@@ -16,6 +16,7 @@ provider "aws" {
 # plus a destroy guard: versioned (recover from a bad write or deletion),
 # encrypted, no public access, TLS only, and prevent_destroy.
 resource "aws_s3_bucket" "state" {
+  #checkov:skip=CKV_AWS_145:State stays on SSE-S3 so it never depends on a key the stack manages.
   bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}"
 
   lifecycle {

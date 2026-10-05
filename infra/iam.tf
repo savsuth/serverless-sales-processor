@@ -1,8 +1,8 @@
 # Every statement below is scoped to a specific resource ARN this
-# project created -- there are no wildcard resource grants in this
-# policy. (The one wildcard suffix you'll see, ":*" appended to the log
-# group ARN, is not "all log groups" -- it means "all log streams within
-# this one log group", which is how CloudWatch Logs ARNs address streams.)
+# project created, except X-Ray tracing, which accepts no resource-level
+# scoping. (The ":*" appended to the log group ARN is not "all log
+# groups" -- it means "all log streams within this one log group", which
+# is how CloudWatch Logs ARNs address streams.)
 
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
@@ -55,6 +55,23 @@ data "aws_iam_policy_document" "lambda_permissions" {
     effect    = "Allow"
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.jobs.arn]
+  }
+
+  statement {
+    sid       = "WriteTraces"
+    effect    = "Allow"
+    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
+    resources = ["*"]
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_kms ? [1] : []
+    content {
+      sid       = "UseProjectKey"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt", "kms:GenerateDataKey"]
+      resources = [local.kms_key_arn]
+    }
   }
 
   dynamic "statement" {

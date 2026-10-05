@@ -73,6 +73,7 @@ resource "aws_glue_catalog_table" "curated" {
 # output buckets this one expires its objects.
 
 resource "aws_s3_bucket" "athena_results" {
+  #checkov:skip=CKV_AWS_21:Query results are disposable copies, expired after a few days.
   count = local.athena_enabled ? 1 : 0
 
   bucket = "${var.project_name}-athena-results-${data.aws_caller_identity.current.account_id}"
@@ -94,7 +95,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "athena_results" {
   bucket = aws_s3_bucket.athena_results[0].id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = var.enable_kms ? "aws:kms" : "AES256"
+      kms_master_key_id = local.kms_key_arn
     }
     bucket_key_enabled = true
   }
@@ -175,7 +177,8 @@ resource "aws_athena_workgroup" "analytics" {
       output_location = "s3://${aws_s3_bucket.athena_results[0].id}/results/"
 
       encryption_configuration {
-        encryption_option = "SSE_S3"
+        encryption_option = var.enable_kms ? "SSE_KMS" : "SSE_S3"
+        kms_key_arn       = local.kms_key_arn
       }
     }
   }

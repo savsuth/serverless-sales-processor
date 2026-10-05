@@ -25,6 +25,11 @@ resource "aws_lambda_function" "processor" {
 
   filename         = data.archive_file.lambda_package.output_path
   source_code_hash = data.archive_file.lambda_package.output_base64sha256
+  kms_key_arn      = local.kms_key_arn
+
+  tracing_config {
+    mode = "Active"
+  }
 
   # Concurrency is capped on the SQS event source mapping below, NOT with
   # reserved_concurrent_executions: when reserved concurrency throttles an

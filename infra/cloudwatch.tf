@@ -10,6 +10,7 @@ locals {
 resource "aws_cloudwatch_log_group" "lambda" {
   name              = "/aws/lambda/${var.project_name}-processor"
   retention_in_days = var.log_retention_days
+  kms_key_id        = local.kms_key_arn
 }
 
 # Alarms publish to the same notification topic as job-completion

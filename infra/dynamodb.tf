@@ -36,4 +36,9 @@ resource "aws_dynamodb_table" "jobs" {
   point_in_time_recovery {
     enabled = true
   }
+
+  server_side_encryption {
+    enabled     = var.enable_kms
+    kms_key_arn = local.kms_key_arn
+  }
 }

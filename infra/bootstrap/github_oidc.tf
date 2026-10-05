@@ -203,6 +203,8 @@ data "aws_iam_policy_document" "github_actions_deploy" {
     resources = [
       "arn:aws:logs:${local.region}:${local.account_id}:log-group:/aws/lambda/${local.prefix}-*",
       "arn:aws:logs:${local.region}:${local.account_id}:log-group:/aws/lambda/${local.prefix}-*:*",
+      "arn:aws:logs:${local.region}:${local.account_id}:log-group:/aws/apigateway/${local.prefix}-*",
+      "arn:aws:logs:${local.region}:${local.account_id}:log-group:/aws/apigateway/${local.prefix}-*:*",
     ]
   }
 
@@ -232,7 +234,64 @@ data "aws_iam_policy_document" "github_actions_deploy" {
     resources = ["arn:aws:budgets::${local.account_id}:budget/${local.prefix}-*"]
   }
 
-  # IAM is limited to the ONE role name the Lambda uses -- not a prefix --
+  statement {
+    sid    = "ManageDashboard"
+    effect = "Allow"
+    actions = [
+      "cloudwatch:PutDashboard", "cloudwatch:GetDashboard", "cloudwatch:DeleteDashboards",
+    ]
+    resources = ["arn:aws:cloudwatch::${local.account_id}:dashboard/${local.prefix}*"]
+  }
+
+  # Unavoidable wildcard #4: HTTP API ARNs contain a random API ID.
+  statement {
+    sid     = "ManagePortalApi"
+    effect  = "Allow"
+    actions = ["apigateway:*"]
+    resources = [
+      "arn:aws:apigateway:${local.region}::/apis",
+      "arn:aws:apigateway:${local.region}::/apis/*",
+      "arn:aws:apigateway:${local.region}::/tags/*",
+    ]
+  }
+
+  # Unavoidable wildcard #5: a new key has no ARN yet. Creation is allowed
+  # only with the project tag, and every later action only on keys that
+  # carry it (the provider's default_tags apply it).
+  statement {
+    sid       = "CreateProjectKey"
+    effect    = "Allow"
+    actions   = ["kms:CreateKey", "kms:TagResource"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Project"
+      values   = [var.project_tag]
+    }
+  }
+
+  statement {
+    sid       = "ManageProjectKey"
+    effect    = "Allow"
+    actions   = ["kms:*"]
+    resources = ["arn:aws:kms:${local.region}:${local.account_id}:key/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = [var.project_tag]
+    }
+  }
+
+  statement {
+    sid       = "ManageProjectKeyAlias"
+    effect    = "Allow"
+    actions   = ["kms:CreateAlias", "kms:DeleteAlias", "kms:UpdateAlias", "kms:ListAliases"]
+    resources = ["arn:aws:kms:${local.region}:${local.account_id}:alias/${local.prefix}*"]
+  }
+
+  # IAM is limited to the role names the Lambdas use -- not a prefix --
   # so this role (named ...-github-actions-deploy) cannot edit itself,
   # which would otherwise be a path to full admin.
   statement {
@@ -244,14 +303,20 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "iam:GetRolePolicy", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
       "iam:ListInstanceProfilesForRole",
     ]
-    resources = ["arn:aws:iam::${local.account_id}:role/${local.prefix}-lambda-exec"]
+    resources = [
+      "arn:aws:iam::${local.account_id}:role/${local.prefix}-lambda-exec",
+      "arn:aws:iam::${local.account_id}:role/${local.prefix}-portal",
+    ]
   }
 
   statement {
-    sid       = "PassExecutionRoleToLambdaOnly"
-    effect    = "Allow"
-    actions   = ["iam:PassRole"]
-    resources = ["arn:aws:iam::${local.account_id}:role/${local.prefix}-lambda-exec"]
+    sid     = "PassExecutionRoleToLambdaOnly"
+    effect  = "Allow"
+    actions = ["iam:PassRole"]
+    resources = [
+      "arn:aws:iam::${local.account_id}:role/${local.prefix}-lambda-exec",
+      "arn:aws:iam::${local.account_id}:role/${local.prefix}-portal",
+    ]
 
     condition {
       test     = "StringEquals"

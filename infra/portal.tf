@@ -55,6 +55,24 @@ data "aws_iam_policy_document" "portal_permissions" {
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.portal[0].arn}:*"]
   }
+
+  # X-Ray accepts no resource-level scoping for these two actions.
+  statement {
+    sid       = "WriteTraces"
+    effect    = "Allow"
+    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
+    resources = ["*"]
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_kms ? [1] : []
+    content {
+      sid       = "UseProjectKey"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt", "kms:GenerateDataKey"]
+      resources = [local.kms_key_arn]
+    }
+  }
 }
 
 resource "aws_iam_role" "portal" {
@@ -74,6 +92,7 @@ resource "aws_cloudwatch_log_group" "portal" {
   count             = var.enable_portal ? 1 : 0
   name              = "/aws/lambda/${var.project_name}-portal"
   retention_in_days = var.log_retention_days
+  kms_key_id        = local.kms_key_arn
 }
 
 resource "aws_lambda_function" "portal" {
@@ -88,6 +107,11 @@ resource "aws_lambda_function" "portal" {
 
   filename         = data.archive_file.lambda_package.output_path
   source_code_hash = data.archive_file.lambda_package.output_base64sha256
+  kms_key_arn      = local.kms_key_arn
+
+  tracing_config {
+    mode = "Active"
+  }
 
   environment {
     variables = {
@@ -131,6 +155,7 @@ resource "aws_apigatewayv2_integration" "portal" {
 }
 
 resource "aws_apigatewayv2_route" "portal" {
+  #checkov:skip=CKV_AWS_309:The function checks the upload token, or a link's HMAC signature.
   for_each = var.enable_portal ? toset([
     "POST /uploads",
     "GET /jobs",
@@ -147,6 +172,7 @@ resource "aws_cloudwatch_log_group" "portal_access" {
   count             = var.enable_portal ? 1 : 0
   name              = "/aws/apigateway/${var.project_name}-portal"
   retention_in_days = var.log_retention_days
+  kms_key_id        = local.kms_key_arn
 }
 
 resource "aws_apigatewayv2_stage" "portal" {

@@ -44,3 +44,9 @@ variable "existing_github_oidc_provider_arn" {
   type        = string
   default     = ""
 }
+
+variable "project_tag" {
+  description = "Value of the Project tag the application stack's provider applies to every resource (infra/providers.tf); KMS permissions for the deploy role are scoped to keys carrying it."
+  type        = string
+  default     = "csv-sales-pipeline"
+}

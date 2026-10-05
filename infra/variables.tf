@@ -132,6 +132,14 @@ variable "notification_email" {
   default     = ""
 }
 
+# --- Encryption -----------------------------------------------------------
+
+variable "enable_kms" {
+  description = "Encrypt data at rest with a customer-managed KMS key (infra/kms.tf) instead of AWS-managed keys. About 1 USD per month plus requests (S3 bucket keys keep request counts low)."
+  type        = bool
+  default     = true
+}
+
 # --- Portal: upload page and report links -----------------------------
 
 variable "enable_portal" {
