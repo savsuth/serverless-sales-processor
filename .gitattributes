@@ -1,0 +1,4 @@
+# Snapshot files are compared byte for byte (rejected_rows.csv uses CRLF
+# line endings, as Python's csv module writes them). Never let git
+# normalize them.
+tests/golden/** -text

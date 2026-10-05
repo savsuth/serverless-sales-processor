@@ -1,0 +1,9 @@
+date,product,quantity,unit_price,row_number,rejection_reason
+2024-02-30,Widget,2,9.99,2,invalid_date
+2024-01-06,,1,5.00,3,empty_product
+2024-01-06,Gadget,'-2,5.00,4,invalid_quantity
+2024-01-06,Gadget,two,5.00,5,invalid_quantity
+2024-01-06,Gadget,2,NaN,6,non_finite_unit_price
+2024-01-06,Gadget,2,'-5.00,7,negative_unit_price
+2024-01-06,Gadget,2,not-a-price,8,invalid_unit_price
+2024-01-07,'=SUM(A1:A9),bad,1.00,9,invalid_quantity

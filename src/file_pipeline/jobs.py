@@ -28,6 +28,24 @@ Every state-changing write after the initial claim is itself conditioned
 on `lease_owner == <our token>`, so a worker whose lease has since been
 stolen by someone else can never clobber that newer worker's result --
 its writes simply fail their condition and it backs off.
+
+Duplicate content
+-----------------
+Job identity is per S3 object version, so the same bytes uploaded under
+a new key (or again under the same key) are a new job. Before a job
+that produced totals writes its reports, `claim_content()` records the
+file's SHA-256 in a fingerprint item (`job_id = "content#<sha256>"`, in
+the same table; real job IDs are bare hex and can never collide):
+
+  * no fingerprint yet, or it names this job -> FIRST (write reports)
+  * names another job that completed         -> DUPLICATE (that job's
+                                                 reports already cover
+                                                 this content)
+  * names another job not yet finished       -> PENDING_ELSEWHERE (retry
+                                                 later; never drop it)
+
+Files that fail validation never claim a fingerprint: they produce no
+totals, so re-running one cannot double count anything.
 """
 
 from __future__ import annotations
@@ -47,11 +65,18 @@ STATUS_PROCESSING = "processing"
 STATUS_COMPLETED = "completed"
 STATUS_COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
 STATUS_VALIDATION_FAILED = "validation_failed"
+STATUS_DUPLICATE_CONTENT = "duplicate_content"
 STATUS_FAILED = "failed"
 
 TERMINAL_STATUSES = frozenset(
-    {STATUS_COMPLETED, STATUS_COMPLETED_WITH_REJECTIONS, STATUS_VALIDATION_FAILED}
+    {
+        STATUS_COMPLETED,
+        STATUS_COMPLETED_WITH_REJECTIONS,
+        STATUS_VALIDATION_FAILED,
+        STATUS_DUPLICATE_CONTENT,
+    }
 )
+COMPLETED_STATUSES = frozenset({STATUS_COMPLETED, STATUS_COMPLETED_WITH_REJECTIONS})
 
 NOTIFICATION_PENDING = "pending"
 NOTIFICATION_SENT = "sent"
@@ -66,6 +91,10 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 def compute_job_id(bucket: str, key: str, version_id: str) -> str:
     digest_input = f"{bucket}\n{key}\n{version_id}".encode()
     return hashlib.sha256(digest_input).hexdigest()
+
+
+def content_fingerprint_key(content_sha256: str) -> str:
+    return f"content#{content_sha256}"
 
 
 def sanitize_error_message(message: str, max_len: int = 500) -> str:
@@ -94,6 +123,18 @@ class ClaimResult:
     status: ClaimStatus
     lease_token: str | None = None
     record: dict[str, Any] | None = None
+
+
+class ContentClaimStatus(StrEnum):
+    FIRST = "first"
+    DUPLICATE = "duplicate"
+    PENDING_ELSEWHERE = "pending_elsewhere"
+
+
+@dataclass
+class ContentClaimResult:
+    status: ContentClaimStatus
+    first_job_id: str
 
 
 def _is_conditional_check_failed(exc: ClientError) -> bool:
@@ -187,6 +228,69 @@ class JobStore:
                 return ClaimResult(status=ClaimStatus.LOST_RACE)
             raise
 
+    def claim_content(self, content_sha256: str, job_id: str) -> ContentClaimResult:
+        """Records `job_id` as the first job to process this exact
+        content, unless another job already did. See the module
+        docstring for the three outcomes."""
+        from boto3.dynamodb.conditions import Attr
+
+        fingerprint_key = content_fingerprint_key(content_sha256)
+        try:
+            self._table.put_item(
+                Item={
+                    "job_id": fingerprint_key,
+                    "record_type": "content_fingerprint",
+                    "first_job_id": job_id,
+                    "created_at": _now_iso(),
+                },
+                ConditionExpression=Attr("job_id").not_exists(),
+            )
+            return ContentClaimResult(ContentClaimStatus.FIRST, job_id)
+        except ClientError as exc:
+            if not _is_conditional_check_failed(exc):
+                raise
+
+        fingerprint = self.get(fingerprint_key)
+        first_job_id = fingerprint["first_job_id"] if fingerprint else ""
+        if first_job_id == job_id:
+            # A retry of the job that claimed this content first.
+            return ContentClaimResult(ContentClaimStatus.FIRST, job_id)
+
+        first_job = self.get(first_job_id) if first_job_id else None
+        if first_job is not None and first_job["status"] in COMPLETED_STATUSES:
+            return ContentClaimResult(ContentClaimStatus.DUPLICATE, first_job_id)
+        return ContentClaimResult(ContentClaimStatus.PENDING_ELSEWHERE, first_job_id)
+
+    def finalize_duplicate(
+        self, job_id: str, token: str, *, duplicate_of: str, content_sha256: str
+    ) -> bool:
+        from boto3.dynamodb.conditions import Attr
+
+        try:
+            self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression=(
+                    "SET #status = :status, updated_at = :updated_at, "
+                    "duplicate_of = :duplicate_of, content_sha256 = :content_sha256, "
+                    "notification_status = :notif_pending "
+                    "REMOVE error_code, error_message"
+                ),
+                ConditionExpression=Attr("lease_owner").eq(token),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":status": STATUS_DUPLICATE_CONTENT,
+                    ":updated_at": _now_iso(),
+                    ":duplicate_of": duplicate_of,
+                    ":content_sha256": content_sha256,
+                    ":notif_pending": NOTIFICATION_PENDING,
+                },
+            )
+            return True
+        except ClientError as exc:
+            if _is_conditional_check_failed(exc):
+                return False
+            raise
+
     def finalize_success(
         self,
         job_id: str,
@@ -197,32 +301,50 @@ class JobStore:
         output_rejected_key: str,
         valid_row_count: int,
         rejected_row_count: int,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        content_sha256: str | None = None,
     ) -> bool:
+        """Records a run that produced reports. `error_code` is set when
+        the file still failed validation (no valid rows, or too many
+        rejected ones); otherwise any error from an earlier failed
+        attempt is cleared."""
         from boto3.dynamodb.conditions import Attr
+
+        values = {
+            ":status": status,
+            ":updated_at": _now_iso(),
+            ":summary_key": output_summary_key,
+            ":rejected_key": output_rejected_key,
+            ":valid_count": valid_row_count,
+            ":rejected_count": rejected_row_count,
+            ":notif_pending": NOTIFICATION_PENDING,
+        }
+        update_expression = (
+            "SET #status = :status, updated_at = :updated_at, "
+            "output_summary_key = :summary_key, "
+            "output_rejected_key = :rejected_key, "
+            "valid_row_count = :valid_count, "
+            "rejected_row_count = :rejected_count, "
+            "notification_status = :notif_pending"
+        )
+        if content_sha256 is not None:
+            update_expression += ", content_sha256 = :content_sha256"
+            values[":content_sha256"] = content_sha256
+        if error_code is None:
+            update_expression += " REMOVE error_code, error_message"
+        else:
+            update_expression += ", error_code = :error_code, error_message = :error_message"
+            values[":error_code"] = error_code
+            values[":error_message"] = sanitize_error_message(error_message or "")
 
         try:
             self._table.update_item(
                 Key={"job_id": job_id},
-                UpdateExpression=(
-                    "SET #status = :status, updated_at = :updated_at, "
-                    "output_summary_key = :summary_key, "
-                    "output_rejected_key = :rejected_key, "
-                    "valid_row_count = :valid_count, "
-                    "rejected_row_count = :rejected_count, "
-                    "notification_status = :notif_pending "
-                    "REMOVE error_code, error_message"
-                ),
+                UpdateExpression=update_expression,
                 ConditionExpression=Attr("lease_owner").eq(token),
                 ExpressionAttributeNames={"#status": "status"},
-                ExpressionAttributeValues={
-                    ":status": status,
-                    ":updated_at": _now_iso(),
-                    ":summary_key": output_summary_key,
-                    ":rejected_key": output_rejected_key,
-                    ":valid_count": valid_row_count,
-                    ":rejected_count": rejected_row_count,
-                    ":notif_pending": NOTIFICATION_PENDING,
-                },
+                ExpressionAttributeValues=values,
             )
             return True
         except ClientError as exc:

@@ -31,6 +31,7 @@ def build_notification_message(
     output_rejected_key: str | None,
     error_code: str | None,
     error_message: str | None,
+    duplicate_of: str | None = None,
 ) -> tuple[str, str]:
     """Returns (subject, body). Reports are private S3 objects (no public
     access) -- the notification names their bucket/key so an authorized
@@ -47,6 +48,13 @@ def build_notification_message(
     if output_summary_key and output_rejected_key and output_bucket:
         lines.append(f"Summary report: s3://{output_bucket}/{output_summary_key}")
         lines.append(f"Rejected rows report: s3://{output_bucket}/{output_rejected_key}")
+
+    if duplicate_of:
+        lines.append(f"Duplicate of job: {duplicate_of}")
+        lines.append(
+            "This file's content was already processed by that job, "
+            "so no new report was written."
+        )
 
     if error_code:
         lines.append(f"Error code: {error_code}")

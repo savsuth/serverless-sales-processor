@@ -3,10 +3,10 @@
 # built into every AWS Lambda Python runtime, so nothing needs to be
 # vendored or pip-installed into the archive). archive_file's hash drives
 # Terraform's update-detection, so any source change produces a new
-# deployment automatically. See README's "Design decisions" section if
-# you later add a third-party dependency beyond boto3 -- you'll need to
-# switch to a build step (pip install --target + zip, or a Lambda layer)
-# instead of zipping src/ directly.
+# deployment automatically. If you later add a third-party dependency
+# beyond boto3, you'll need to switch to a build step (pip install
+# --target + zip, or a Lambda layer) instead of zipping src/ directly;
+# docs/decisions/0007 and 0010 describe what this constraint shapes.
 data "archive_file" "lambda_package" {
   type        = "zip"
   source_dir  = "${path.module}/../src"
@@ -40,6 +40,7 @@ resource "aws_lambda_function" "processor" {
       NOTIFICATION_TOPIC_ARN = aws_sns_topic.notifications.arn
       LEASE_SECONDS          = tostring(var.job_lease_seconds)
       MAX_INPUT_BYTES        = tostring(var.max_input_bytes)
+      SCHEMA_NAME            = var.schema_name
       LOG_LEVEL              = "INFO"
     }
   }

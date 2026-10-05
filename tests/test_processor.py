@@ -1,4 +1,6 @@
 import csv
+import dataclasses
+import hashlib
 import io
 from decimal import Decimal
 
@@ -10,6 +12,7 @@ from file_pipeline.processor import (
     build_summary_dict,
     process_csv,
 )
+from file_pipeline.schema import load_schema
 
 
 def _run(csv_text: str, max_bytes: int | None = None):
@@ -215,3 +218,45 @@ def test_summary_dict_serializes_money_as_plain_decimal_strings():
         assert isinstance(product_summary["revenue"], str)
         # no scientific notation, no float artifacts
         assert "e" not in product_summary["revenue"].lower()
+
+
+# --- Rejection-rate threshold (the sales schema allows at most 50%) ---
+
+
+def test_rejection_rate_at_the_limit_still_completes():
+    csv_text = "date,product,quantity,unit_price\n2024-01-01,Widget,1,1.00\nbad,Widget,1,1.00\n"
+    result, _ = _run(csv_text)
+    assert result.status == "completed_with_rejections"
+    assert result.error_code is None
+
+
+def test_rejection_rate_above_the_limit_fails_but_keeps_totals():
+    csv_text = (
+        "date,product,quantity,unit_price\n"
+        "2024-01-01,Widget,2,1.50\nbad,Widget,1,1.00\n2024-01-01,,1,1.00\n"
+    )
+    result, rejected_rows = _run(csv_text)
+    assert result.status == "validation_failed"
+    assert result.error_code == "rejection_rate_exceeded"
+    assert result.error_message == "2 of 3 rows rejected (66.7%), above the 50% limit"
+    assert build_summary_dict(result)["total_revenue"] == "3.00"
+    assert len(rejected_rows) == 3
+
+
+def test_zero_valid_rows_reports_no_valid_rows():
+    result, _ = _run("date,product,quantity,unit_price\nbad-date,Widget,1,1.00\n")
+    assert result.error_code == "no_valid_rows"
+
+
+def test_schema_without_a_limit_accepts_any_rejection_rate():
+    schema = dataclasses.replace(load_schema(), max_rejection_rate=None)
+    csv_text = "date,product,quantity,unit_price\n2024-01-01,Widget,1,1.00\n" + "bad,W,1,1\n" * 9
+    binary = io.BytesIO(csv_text.encode("utf-8"))
+    result = process_csv(binary, io.StringIO(), schema=schema)
+    assert result.status == "completed_with_rejections"
+
+
+def test_content_fingerprint_is_the_sha256_of_the_exact_bytes():
+    data = VALID_CSV.encode("utf-8")
+    result = process_csv(io.BytesIO(data), io.StringIO())
+    assert result.content_sha256 == hashlib.sha256(data).hexdigest()

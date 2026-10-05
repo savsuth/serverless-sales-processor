@@ -1,0 +1,4 @@
+date,product,quantity,unit_price,row_number,rejection_reason
+2024-02-02,Widget,two,9.99,3,invalid_quantity
+2024-02-02,,1,19.50,4,empty_product
+2024-02-03,Gizmo,3,free,5,invalid_unit_price

@@ -28,7 +28,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
 
 resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
   alarm_name        = "${var.project_name}-dlq-messages"
-  alarm_description = "One or more messages have landed in the dead-letter queue and need investigation (see README's retry/redrive runbook)."
+  alarm_description = "One or more messages have landed in the dead-letter queue and need investigation. Fix the cause, then move them back with scripts/redrive_dlq.sh."
   namespace         = "AWS/SQS"
   metric_name       = "ApproximateNumberOfMessagesVisible"
   dimensions = {
