@@ -132,6 +132,26 @@ variable "notification_email" {
   default     = ""
 }
 
+# --- Portal: upload page and report links -----------------------------
+
+variable "enable_portal" {
+  description = "Create the token-protected portal API used by tools/upload.html and by the download links in notification emails."
+  type        = bool
+  default     = true
+}
+
+variable "report_link_days" {
+  description = "How long the download links in notification emails stay valid."
+  type        = number
+  default     = 7
+}
+
+variable "portal_requests_per_second" {
+  description = "API Gateway steady-state request limit for the portal (burst is twice this)."
+  type        = number
+  default     = 10
+}
+
 # --- Budget alert (optional) -------------------------------------------
 
 variable "enable_budget_alert" {

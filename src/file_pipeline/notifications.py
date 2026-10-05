@@ -37,6 +37,8 @@ def build_notification_message(
     duplicate_of: str | None = None,
     warning_counts: dict[str, int] | None = None,
     next_step: str | None = None,
+    download_links: dict[str, str] | None = None,
+    links_expire_at: str | None = None,
 ) -> tuple[str, str]:
     """Returns (subject, body). Reports are private S3 objects (no public
     access) -- the notification names their bucket/key so an authorized
@@ -57,6 +59,10 @@ def build_notification_message(
             for name, count in flagged.items()
         ]
         lines.append(f"Warnings: {', '.join(parts)} (row numbers are in summary.json)")
+
+    if download_links:
+        lines.append(f"Download links (valid until {links_expire_at}):")
+        lines.extend(f"  {name}: {url}" for name, url in download_links.items())
 
     if output_summary_key and output_rejected_key and output_bucket:
         lines.append(f"Summary report: s3://{output_bucket}/{output_summary_key}")

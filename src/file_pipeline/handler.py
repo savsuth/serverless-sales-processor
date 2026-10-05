@@ -26,11 +26,12 @@ import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from file_pipeline import jobs, notifications, storage
+from file_pipeline import jobs, links, notifications, storage
 from file_pipeline.curated import CuratedWriter
 from file_pipeline.processor import (
     MAX_INPUT_BYTES,
@@ -151,6 +152,7 @@ class Dependencies:
     max_receive_count: int = 5
     metrics_namespace: str = "CsvSalesPipeline"
     events: notifications.EventPublisher | None = None
+    report_links: links.ReportLinks | None = None
 
 
 def _default_dependencies() -> Dependencies:
@@ -170,6 +172,17 @@ def _default_dependencies() -> Dependencies:
         else None
     )
 
+    portal_url = os.environ.get("PORTAL_URL", "")
+    report_links = (
+        links.ReportLinks(
+            base_url=portal_url,
+            key=os.environ["LINK_SIGNING_KEY"].encode(),
+            valid_seconds=int(os.environ.get("REPORT_LINK_DAYS", 7)) * 86400,
+        )
+        if portal_url
+        else None
+    )
+
     return Dependencies(
         job_store=jobs.JobStore(
             table, lease_seconds=lease_seconds, rules=(schema.name, schema.version)
@@ -184,6 +197,7 @@ def _default_dependencies() -> Dependencies:
         max_receive_count=int(os.environ.get("MAX_RECEIVE_COUNT", 5)),
         metrics_namespace=os.environ.get("METRICS_NAMESPACE", "CsvSalesPipeline"),
         events=events,
+        report_links=report_links,
     )
 
 
@@ -739,6 +753,10 @@ def _notify_and_ack(
     duplicate_of: str | None = None,
     warning_counts: dict[str, int] | None = None,
 ) -> bool:
+    download_links = links_expire_at = None
+    if deps.report_links is not None and output_summary_key:
+        download_links, expires_at = deps.report_links.for_job(job_id, now=time.time())
+        links_expire_at = datetime.fromtimestamp(expires_at, UTC).strftime("%Y-%m-%d %H:%M UTC")
     subject, body = notifications.build_notification_message(
         job_id=job_id,
         status=status,
@@ -751,6 +769,8 @@ def _notify_and_ack(
         error_message=error_message,
         duplicate_of=duplicate_of,
         warning_counts=warning_counts,
+        download_links=download_links,
+        links_expire_at=links_expire_at,
     )
     try:
         deps.notifier.publish(job_id=job_id, subject=subject, body=body)

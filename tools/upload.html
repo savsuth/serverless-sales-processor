@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sales CSV upload</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --text: #1d2330;
+      --muted: #5a6478;
+      --border: #d9dee7;
+      --accent: #1f5fbf;
+      --accent-text: #ffffff;
+      --ok: #1f7a4d;
+      --warn: #9a5b00;
+      --bad: #b3261e;
+      --radius: 8px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12151b;
+        --surface: #1b2029;
+        --text: #e6e9ef;
+        --muted: #a2abbd;
+        --border: #313948;
+        --accent: #7aa7ff;
+        --accent-text: #0b1220;
+        --ok: #6fd3a0;
+        --warn: #f0b45c;
+        --bad: #ff8a80;
+      }
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 640px; margin: 0 auto; padding: 32px 16px 64px; }
+    h1 { font-size: 1.5rem; margin: 0 0 4px; }
+    .lede { color: var(--muted); margin: 0 0 24px; }
+    section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    h2 { font-size: 1rem; margin: 0 0 12px; }
+    label { display: block; font-weight: 600; margin: 12px 0 4px; }
+    label:first-of-type { margin-top: 0; }
+    .hint { color: var(--muted); font-size: 0.875rem; margin: 4px 0 0; }
+    input[type="url"], input[type="password"], input[type="file"] {
+      width: 100%;
+      font: inherit;
+      color: inherit;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    input:focus-visible, button:focus-visible, a:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+    button, .button {
+      font: inherit;
+      font-weight: 600;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: var(--accent-text);
+      border-radius: 6px;
+      padding: 8px 16px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    button.secondary, .button.secondary { background: transparent; color: var(--accent); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .remember { display: flex; gap: 8px; align-items: center; font-weight: 400; margin-top: 8px; }
+    #progress { color: var(--muted); min-height: 1.5em; margin: 12px 0 0; }
+    .status { font-weight: 700; }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.bad { color: var(--bad); }
+    dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 12px 0 0; }
+    dt { color: var(--muted); }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Sales CSV upload</h1>
+  <p class="lede">Uploads a <code>.csv</code> or <code>.csv.gz</code> file to the pipeline and shows the result when it has been processed.</p>
+
+  <section aria-labelledby="connect-heading">
+    <h2 id="connect-heading">Connection</h2>
+    <label for="portal-url">Portal URL</label>
+    <input id="portal-url" type="url" placeholder="https://abc123.execute-api.us-east-2.amazonaws.com" autocomplete="off" required>
+    <p class="hint">From <code>terraform output -raw portal_url</code></p>
+
+    <label for="token">Upload token</label>
+    <input id="token" type="password" autocomplete="off" required>
+    <p class="hint">From <code>terraform output -raw upload_token</code>. Never saved by this page.</p>
+
+    <label class="remember"><input id="remember" type="checkbox"> Remember the portal URL on this computer</label>
+  </section>
+
+  <section aria-labelledby="upload-heading">
+    <h2 id="upload-heading">File</h2>
+    <label for="file">Sales file</label>
+    <input id="file" type="file" accept=".csv,.gz,text/csv,application/gzip">
+    <div class="row">
+      <button id="upload" type="button">Upload</button>
+    </div>
+    <p id="progress" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="result" aria-labelledby="result-heading" hidden>
+    <h2 id="result-heading">Result</h2>
+    <p>Status: <span id="status" class="status"></span></p>
+    <dl id="details"></dl>
+    <div class="row" id="downloads"></div>
+    <div class="row">
+      <button id="refresh" type="button" class="secondary">Refresh</button>
+    </div>
+    <p class="hint">Download links last five minutes; Refresh gets new ones.</p>
+  </section>
+</main>
+
+<script>
+  "use strict";
+
+  const FINAL = new Set(["completed", "completed_with_rejections", "validation_failed", "duplicate_content", "dead_lettered"]);
+  const TONE = {
+    completed: "ok",
+    completed_with_rejections: "warn",
+    duplicate_content: "warn",
+    validation_failed: "bad",
+    dead_lettered: "bad",
+  };
+  const POLL_MS = 2000;
+  const POLL_LIMIT_MS = 3 * 60 * 1000;
+
+  const $ = (id) => document.getElementById(id);
+  let currentJob = null;
+
+  function storageGet(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+  }
+  function storageSet(key, value) {
+    try {
+      if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value);
+    } catch { /* storage unavailable: nothing to remember */ }
+  }
+
+  const saved = storageGet("portalUrl");
+  if (saved) { $("portal-url").value = saved; $("remember").checked = true; }
+
+  function portalUrl() { return $("portal-url").value.trim().replace(/\/+$/, ""); }
+  function say(text) { $("progress").textContent = text; }
+
+  async function api(path, options = {}) {
+    const response = await fetch(portalUrl() + path, {
+      ...options,
+      headers: { authorization: "Bearer " + $("token").value.trim(), "content-type": "application/json" },
+    });
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 401) throw new Error("The upload token was not accepted.");
+    return { status: response.status, body };
+  }
+
+  async function jobIdFor(key, versionId) {
+    const query = new URLSearchParams({ key, version: versionId });
+    const { status, body } = await api(`/jobs?${query}`);
+    if (!body.job_id) throw new Error(body.error || `Could not look up the job (${status}).`);
+    return body.job_id;
+  }
+
+  function show(job) {
+    $("result").hidden = false;
+    const status = $("status");
+    status.textContent = job.status.replaceAll("_", " ");
+    status.className = "status " + (TONE[job.status] || "");
+
+    const details = $("details");
+    details.replaceChildren();
+    const add = (term, value) => {
+      if (value === undefined || value === null || value === "") return;
+      const dt = document.createElement("dt");
+      dt.textContent = term;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      details.append(dt, dd);
+    };
+    add("File", job.source_key);
+    add("Valid rows", job.valid_row_count);
+    add("Rejected rows", job.rejected_row_count);
+    const warnings = Object.entries(job.warning_counts || {}).filter(([, n]) => n > 0);
+    if (warnings.length) add("Warnings", warnings.map(([k, n]) => `${n} ${k.replaceAll("_", " ")}`).join(", "));
+    add("Duplicate of job", job.duplicate_of);
+    add("Error", job.error_code ? `${job.error_code}${job.error_message ? ": " + job.error_message : ""}` : "");
+    add("Job ID", job.job_id);
+
+    const downloads = $("downloads");
+    downloads.replaceChildren();
+    for (const [name, url] of Object.entries(job.downloads || {})) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.textContent = "Download " + name;
+      a.className = "button secondary";
+      a.rel = "noopener";
+      downloads.append(a);
+    }
+  }
+
+  async function follow(jobId) {
+    currentJob = jobId;
+    const started = Date.now();
+    while (Date.now() - started < POLL_LIMIT_MS) {
+      const { status, body } = await api(`/jobs/${jobId}`);
+      if (status === 200) {
+        show(body);
+        if (FINAL.has(body.status)) { say("Done."); return; }
+        say(body.status === "failed" ? `Retrying after ${body.error_code}...` : "Processing...");
+      } else if (status === 404) {
+        say("Waiting for processing to start...");
+      } else {
+        throw new Error(body.error || `Unexpected response (${status}).`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+    }
+    say(`Still not finished. Check again later with Refresh (job ${jobId}).`);
+  }
+
+  async function upload() {
+    const file = $("file").files[0];
+    if (!portalUrl() || !$("token").value.trim()) { say("Enter the portal URL and upload token first."); return; }
+    if (!file) { say("Choose a file first."); return; }
+    storageSet("portalUrl", $("remember").checked ? portalUrl() : null);
+
+    $("upload").disabled = true;
+    $("result").hidden = true;
+    try {
+      say("Requesting an upload link...");
+      const { status, body } = await api("/uploads", { method: "POST", body: JSON.stringify({ filename: file.name }) });
+      if (status !== 200) throw new Error(body.error || `Upload link refused (${status}).`);
+      if (file.size > body.max_bytes) throw new Error(`The file is larger than the ${body.max_bytes}-byte limit.`);
+
+      say(`Uploading ${(file.size / 1024).toFixed(1)} KB...`);
+      const form = new FormData();
+      for (const [name, value] of Object.entries(body.fields)) form.append(name, value);
+      form.append("file", file);
+      const s3 = await fetch(body.url, { method: "POST", body: form });
+      if (!s3.ok) throw new Error(`The upload was rejected by S3 (${s3.status}).`);
+      const versionId = s3.headers.get("x-amz-version-id");
+      if (!versionId) throw new Error("Uploaded, but S3 did not return a version ID, so the job cannot be followed here.");
+
+      await follow(await jobIdFor(body.key, versionId));
+    } catch (error) {
+      say(error.message === "Failed to fetch" ? "Could not reach the portal. Check the URL." : error.message);
+    } finally {
+      $("upload").disabled = false;
+    }
+  }
+
+  $("upload").addEventListener("click", upload);
+  $("refresh").addEventListener("click", () => {
+    if (currentJob) follow(currentJob).catch((error) => say(error.message));
+  });
+</script>
+</body>
+</html>

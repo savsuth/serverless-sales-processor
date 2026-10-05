@@ -61,3 +61,14 @@ output "job_status_index_name" {
   description = "DynamoDB index for listing jobs by status (scripts/list_jobs.sh)."
   value       = "status-created_at-index"
 }
+
+output "portal_url" {
+  description = "Paste into tools/upload.html along with the upload token."
+  value       = local.portal_url
+}
+
+output "upload_token" {
+  description = "Secret for tools/upload.html: terraform output -raw upload_token"
+  value       = var.enable_portal ? random_password.upload_token[0].result : null
+  sensitive   = true
+}

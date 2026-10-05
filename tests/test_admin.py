@@ -59,9 +59,11 @@ def _process(stack, key, body=CSV):
 
 
 def _deliver_queued(stack):
-    messages = stack["sqs"].receive_message(
-        QueueUrl=stack["queue_url"], MaxNumberOfMessages=10
-    ).get("Messages", [])
+    messages = (
+        stack["sqs"]
+        .receive_message(QueueUrl=stack["queue_url"], MaxNumberOfMessages=10)
+        .get("Messages", [])
+    )
     records = [{"messageId": m["MessageId"], "body": m["Body"]} for m in messages]
     return handler.handle_event({"Records": records}, stack["deps"])
 

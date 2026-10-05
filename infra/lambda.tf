@@ -45,6 +45,9 @@ resource "aws_lambda_function" "processor" {
       METRICS_NAMESPACE      = local.metrics_namespace
       EVENT_BUS_NAME         = var.enable_events ? "default" : ""
       EVENT_SOURCE           = var.project_name
+      PORTAL_URL             = local.portal_url
+      LINK_SIGNING_KEY       = local.link_signing_key
+      REPORT_LINK_DAYS       = tostring(var.report_link_days)
       LOG_LEVEL              = "INFO"
     }
   }
