@@ -12,6 +12,8 @@ Design decisions (documented here because the task spec leaves them open):
 
 * Column matching is case-insensitive and ignores surrounding whitespace,
   e.g. " Date" and "date" both satisfy the "date" requirement.
+* The field separator is chosen per file from the schema's `delimiters`:
+  the first one that splits the header into all the required columns.
 * Duplicate header names (after normalization) make the whole file
   malformed, because we can no longer say which column a value belongs to.
 * Extra, unrecognized columns are allowed. Their values are preserved
@@ -51,6 +53,7 @@ import datetime
 import gzip
 import hashlib
 import io
+import itertools
 import re
 import zlib
 from collections.abc import Callable
@@ -224,6 +227,18 @@ def _normalize_header_name(name: str) -> str:
     return name.strip().lower()
 
 
+def _detect_delimiter(header_line: str, schema: Schema) -> str:
+    """The first of the schema's delimiters that splits the header line
+    into all the required columns. Falls back to the first delimiter, so
+    a file matching none fails header validation with the usual error."""
+    required = set(schema.column_names)
+    for delimiter in schema.delimiters:
+        fields = next(csv.reader([header_line], delimiter=delimiter), [])
+        if required <= {_normalize_header_name(f) for f in fields}:
+            return delimiter
+    return schema.delimiters[0]
+
+
 def _validate_header(header: list[str], schema: Schema) -> dict[str, int]:
     normalized = [_normalize_header_name(h) for h in header]
 
@@ -327,11 +342,12 @@ def process_csv(
     raw = _CountingRawReader(_decompressed(binary_stream), max_bytes)
     try:
         text_stream = _open_text_stream(raw)
-        reader = csv.reader(text_stream)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise MalformedCSVError("empty_file", "CSV file is empty") from None
+        header_line = text_stream.readline()
+        if not header_line:
+            raise MalformedCSVError("empty_file", "CSV file is empty")
+        delimiter = _detect_delimiter(header_line, schema)
+        reader = csv.reader(itertools.chain([header_line], text_stream), delimiter=delimiter)
+        header = next(reader)
 
         column_index = _validate_header(header, schema)
         header_len = len(header)

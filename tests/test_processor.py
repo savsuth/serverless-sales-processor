@@ -289,3 +289,26 @@ def test_size_limit_applies_to_decompressed_bytes():
     assert len(compressed) < 100_000
     with pytest.raises(InputTooLargeError):
         process_csv(io.BytesIO(compressed), io.StringIO(), max_bytes=100_000)
+
+
+# --- Field separators ---
+
+
+@pytest.mark.parametrize("delimiter", [";", "\t"])
+def test_semicolon_and_tab_separated_files_give_the_same_totals(delimiter):
+    converted = VALID_CSV.replace(",", delimiter)
+    comma_result, _ = _run(VALID_CSV)
+    other_result, _ = _run(converted)
+    assert build_summary_dict(other_result) == build_summary_dict(comma_result)
+
+
+def test_a_comma_inside_a_semicolon_file_stays_part_of_the_value():
+    csv_text = "date;product;quantity;unit_price\n2024-01-01;Widget, large;2;1.50\n"
+    result, _ = _run(csv_text)
+    assert list(result.by_product) == ["Widget, large"]
+
+
+def test_unknown_separator_fails_with_missing_columns():
+    with pytest.raises(MalformedCSVError) as exc_info:
+        _run("date|product|quantity|unit_price\n2024-01-01|Widget|1|1.00\n")
+    assert exc_info.value.code == "missing_required_columns"

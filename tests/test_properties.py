@@ -304,3 +304,25 @@ def test_curated_rows_add_up_to_the_summary(rows):
     assert sum((row["revenue"] for _, row in curated_rows), Decimal("0")) == result.total_revenue
     for key, row in curated_rows:
         assert f"/month={row['date'][:7]}/" in key
+
+
+def _to_csv_bytes_with(rows: list[Row], delimiter: str) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, delimiter=delimiter)
+    writer.writerow(HEADER)
+    for row in rows:
+        if row is BLANK:
+            buffer.write("\r\n")
+        else:
+            writer.writerow(row.fields)
+    return buffer.getvalue().encode("utf-8")
+
+
+@settings(max_examples=200, deadline=None)
+@given(sales_files, st.sampled_from([";", "\t"]))
+def test_the_field_separator_does_not_change_the_result(rows, delimiter):
+    comma = process_csv(io.BytesIO(_to_csv_bytes(rows)), io.StringIO())
+    other = process_csv(io.BytesIO(_to_csv_bytes_with(rows, delimiter)), io.StringIO())
+
+    assert summary_json_bytes(other) == summary_json_bytes(comma)
+    assert other.status == comma.status

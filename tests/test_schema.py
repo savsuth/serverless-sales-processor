@@ -238,3 +238,17 @@ def test_measure_cannot_reuse_a_column_name_for_a_different_calculation():
 def test_schema_name_must_be_a_plain_identifier(name):
     with pytest.raises(SchemaError):
         parse_schema({**INVENTORY_SCHEMA, "name": name})
+
+
+def test_bundled_sales_schema_accepts_comma_semicolon_and_tab():
+    assert load_schema().delimiters == (",", ";", "\t")
+
+
+def test_delimiters_default_to_comma():
+    assert parse_schema(INVENTORY_SCHEMA).delimiters == (",",)
+
+
+@pytest.mark.parametrize("delimiters", [[], [",,"], ["a"], ['"'], [",", ","], "abc", [" "]])
+def test_invalid_delimiters_are_rejected(delimiters):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "delimiters": delimiters})

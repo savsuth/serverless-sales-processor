@@ -13,6 +13,7 @@
       { "name": "revenue", "multiply": ["quantity", "unit_price"], "total": true }
     ]
   },
+  "delimiters": [",", ";", "\t"],
   "max_rejection_rate": 0.5,
   "curated": { "partition_by_month": "date" }
 }

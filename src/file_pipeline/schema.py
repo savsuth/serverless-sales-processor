@@ -49,6 +49,11 @@ rejected rows is strictly above it, even though some rows were valid:
 its reports are still written, but its status is `validation_failed`.
 Omit it to accept any share of rejected rows.
 
+`delimiters` (optional, default `[","]`) lists the field separators a
+file may use, in order of preference; the first one that splits the
+header into all the required columns is used, so semicolon- or
+tab-separated exports work without any setting per file.
+
 `curated` (optional) makes the Lambda also write every valid row of a
 completed job as queryable data for Athena, one file per calendar month
 of the named date column (see curated.py):
@@ -117,6 +122,7 @@ class Schema:
     measures: tuple[Measure, ...]
     max_rejection_rate: Decimal | None = None
     curated_partition_column: str | None = None
+    delimiters: tuple[str, ...] = (",",)
 
     @property
     def column_names(self) -> tuple[str, ...]:
@@ -145,7 +151,7 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         data,
         "schema",
         required={"name", "columns", "aggregation"},
-        optional={"max_rejection_rate", "curated"},
+        optional={"max_rejection_rate", "curated", "delimiters"},
     )
     name = data["name"]
     if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
@@ -185,7 +191,18 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         measures=measures,
         max_rejection_rate=_parse_rate(data.get("max_rejection_rate")),
         curated_partition_column=_parse_curated(data.get("curated"), by_name, measures),
+        delimiters=_parse_delimiters(data.get("delimiters", [","])),
     )
+
+
+def _parse_delimiters(value: Any) -> tuple[str, ...]:
+    delimiters = tuple(_non_empty_list(value, "delimiters"))
+    for d in delimiters:
+        if not isinstance(d, str) or len(d) != 1 or d.isalnum() or d in "\"\r\n ":
+            raise SchemaError(f"each delimiter must be one punctuation or tab character: {d!r}")
+    if len(set(delimiters)) != len(delimiters):
+        raise SchemaError("delimiters must be unique")
+    return delimiters
 
 
 def _parse_curated(
