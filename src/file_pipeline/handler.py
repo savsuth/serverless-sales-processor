@@ -27,7 +27,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from file_pipeline import jobs, notifications, storage
 from file_pipeline.curated import CuratedWriter
@@ -70,6 +70,11 @@ if not logger.handlers:
 
 REJECTED_BUFFER_SPOOL_BYTES = 1024 * 1024
 
+# Errors that can interrupt reading the object mid-stream (network, S3).
+# Any other exception raised while processing comes from this code
+# itself and would recur on every attempt with the same bytes.
+TRANSIENT_READ_ERRORS = (BotoCoreError, ClientError, OSError)
+
 
 def _describe_exception(exc: Exception) -> str:
     """A safe, content-free description for the job record and logs. Raw
@@ -105,6 +110,9 @@ class Dependencies:
     output_bucket: str
     max_input_bytes: int = MAX_INPUT_BYTES
     schema: Schema = field(default_factory=load_schema)
+    # Must match the queue's redrive maxReceiveCount: the delivery with
+    # this receive count is the last one before the dead-letter queue.
+    max_receive_count: int = 5
 
 
 def _default_dependencies() -> Dependencies:
@@ -123,6 +131,7 @@ def _default_dependencies() -> Dependencies:
         output_bucket=os.environ["OUTPUT_BUCKET_NAME"],
         max_input_bytes=int(os.environ.get("MAX_INPUT_BYTES", MAX_INPUT_BYTES)),
         schema=load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA)),
+        max_receive_count=int(os.environ.get("MAX_RECEIVE_COUNT", 5)),
     )
 
 
@@ -174,13 +183,21 @@ def _process_sqs_record(record: dict, deps: Dependencies, *, message_id: str) ->
         _log_info("sqs_message_with_no_s3_records_ignored", sqs_message_id=message_id)
         return True
 
+    receive_count = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1"))
+    final_attempt = receive_count >= deps.max_receive_count
+
     all_ok = True
     for s3_record in s3_records:
-        all_ok = _process_s3_record(s3_record, deps, message_id=message_id) and all_ok
+        ok = _process_s3_record(
+            s3_record, deps, message_id=message_id, final_attempt=final_attempt
+        )
+        all_ok = ok and all_ok
     return all_ok
 
 
-def _process_s3_record(s3_record: dict, deps: Dependencies, *, message_id: str) -> bool:
+def _process_s3_record(
+    s3_record: dict, deps: Dependencies, *, message_id: str, final_attempt: bool = False
+) -> bool:
     try:
         event_name = s3_record.get("eventName", "")
         if not event_name.startswith("ObjectCreated:"):
@@ -209,10 +226,18 @@ def _process_s3_record(s3_record: dict, deps: Dependencies, *, message_id: str) 
         return True
 
     job_id = jobs.compute_job_id(bucket, key, version_id)
-    return _process_job(job_id, bucket, key, version_id, deps)
+    return _process_job(job_id, bucket, key, version_id, deps, final_attempt=final_attempt)
 
 
-def _process_job(job_id: str, bucket: str, key: str, version_id: str, deps: Dependencies) -> bool:
+def _process_job(
+    job_id: str,
+    bucket: str,
+    key: str,
+    version_id: str,
+    deps: Dependencies,
+    *,
+    final_attempt: bool = False,
+) -> bool:
     claim = deps.job_store.claim(job_id, bucket, key, version_id)
 
     if claim.status in (jobs.ClaimStatus.ACTIVE_ELSEWHERE, jobs.ClaimStatus.LOST_RACE):
@@ -228,16 +253,27 @@ def _process_job(job_id: str, bucket: str, key: str, version_id: str, deps: Depe
 
     assert claim.status is jobs.ClaimStatus.OWNED
     assert claim.lease_token is not None
-    return _run_processing(job_id, bucket, key, version_id, claim.lease_token, deps)
+    return _run_processing(
+        job_id, bucket, key, version_id, claim.lease_token, deps, final_attempt=final_attempt
+    )
 
 
 def _run_processing(
-    job_id: str, bucket: str, key: str, version_id: str, token: str, deps: Dependencies
+    job_id: str,
+    bucket: str,
+    key: str,
+    version_id: str,
+    token: str,
+    deps: Dependencies,
+    *,
+    final_attempt: bool = False,
 ) -> bool:
     try:
         content_length = deps.object_storage.head_object(bucket, key, version_id)
     except Exception as exc:  # noqa: BLE001 - classified as a temporary AWS error
-        return _fail(job_id, token, deps, error_code="s3_head_object_error", exc=exc)
+        return _fail(
+            job_id, token, deps, error_code="s3_head_object_error", exc=exc, final=final_attempt
+        )
 
     if content_length > deps.max_input_bytes:
         return _finish_validation_failed(
@@ -254,7 +290,9 @@ def _run_processing(
     try:
         handle = deps.object_storage.open_object(bucket, key, version_id)
     except Exception as exc:  # noqa: BLE001
-        return _fail(job_id, token, deps, error_code="s3_get_object_error", exc=exc)
+        return _fail(
+            job_id, token, deps, error_code="s3_get_object_error", exc=exc, final=final_attempt
+        )
 
     # Collects valid rows for Athena while the file streams; they are
     # only uploaded below if the job completes with new content.
@@ -287,8 +325,19 @@ def _run_processing(
                 error_code="input_too_large",
                 error_message=f"Input exceeded the {exc.max_bytes}-byte limit while streaming",
             )
-        except Exception as exc:  # noqa: BLE001 - unexpected processing failure
-            return _fail(job_id, token, deps, error_code="processing_error", exc=exc)
+        except TRANSIENT_READ_ERRORS as exc:
+            return _fail(
+                job_id, token, deps, error_code="s3_read_error", exc=exc, final=final_attempt
+            )
+        except Exception as exc:  # noqa: BLE001 - a bug: retrying the same bytes cannot help
+            return _dead_letter(
+                job_id,
+                token,
+                deps,
+                error_code="processing_error",
+                error_message=_describe_exception(exc),
+                in_queue=False,
+            )
 
         # Only a file that produced totals is checked for duplicate
         # content: re-running a failed file cannot double count anything.
@@ -296,7 +345,14 @@ def _run_processing(
             try:
                 content = deps.job_store.claim_content(result.content_sha256, job_id)
             except Exception as exc:  # noqa: BLE001 - temporary AWS error
-                return _fail(job_id, token, deps, error_code="content_claim_error", exc=exc)
+                return _fail(
+                    job_id,
+                    token,
+                    deps,
+                    error_code="content_claim_error",
+                    exc=exc,
+                    final=final_attempt,
+                )
             if content.status is jobs.ContentClaimStatus.DUPLICATE:
                 return _finish_duplicate(
                     job_id,
@@ -307,7 +363,11 @@ def _run_processing(
                 )
             if content.status is jobs.ContentClaimStatus.PENDING_ELSEWHERE:
                 return _wait_for_original(
-                    job_id, token, deps, original_job_id=content.first_job_id
+                    job_id,
+                    token,
+                    deps,
+                    original_job_id=content.first_job_id,
+                    final=final_attempt,
                 )
 
         # Reaching here with a completed status means this job owns the
@@ -326,7 +386,7 @@ def _run_processing(
             )
         except Exception as exc:  # noqa: BLE001 - temporary AWS error
             return _fail(
-                job_id, token, deps, error_code="s3_put_report_error", exc=exc
+                job_id, token, deps, error_code="s3_put_report_error", exc=exc, final=final_attempt
             )
 
     owned = deps.job_store.finalize_success(
@@ -416,28 +476,106 @@ def _finish_duplicate(
 
 
 def _wait_for_original(
-    job_id: str, token: str, deps: Dependencies, *, original_job_id: str
+    job_id: str, token: str, deps: Dependencies, *, original_job_id: str, final: bool = False
 ) -> bool:
     """Another job is processing the same content and hasn't finished.
     Leave this message retryable: by a later delivery that job has
     completed (this one then ends as a duplicate) or failed and is
     itself being retried. Logged at INFO: waiting is not an error."""
+    error_message = f"Same content as job {original_job_id}, which has not finished yet"
+    if final:
+        return _dead_letter(
+            job_id,
+            token,
+            deps,
+            error_code="waiting_for_original_job",
+            error_message=error_message,
+            in_queue=True,
+        )
     deps.job_store.mark_failed(
-        job_id,
-        token,
-        error_code="waiting_for_original_job",
-        error_message=f"Same content as job {original_job_id}, which has not finished yet",
+        job_id, token, error_code="waiting_for_original_job", error_message=error_message
     )
     _log_info("duplicate_waiting_for_original_job", job_id=job_id, original_job_id=original_job_id)
     return False
 
 
-def _fail(job_id: str, token: str, deps: Dependencies, *, error_code: str, exc: Exception) -> bool:
+def _fail(
+    job_id: str,
+    token: str,
+    deps: Dependencies,
+    *,
+    error_code: str,
+    exc: Exception,
+    final: bool = False,
+) -> bool:
+    """A failure worth retrying. On the last allowed delivery the job is
+    dead-lettered instead, so it does not sit at "failed" forever."""
+    if final:
+        return _dead_letter(
+            job_id,
+            token,
+            deps,
+            error_code=error_code,
+            error_message=_describe_exception(exc),
+            in_queue=True,
+        )
     deps.job_store.mark_failed(
         job_id, token, error_code=error_code, error_message=_describe_exception(exc)
     )
     _log_error("job_processing_failed", job_id=job_id, error_code=error_code)
     return False
+
+
+def _dead_letter(
+    job_id: str,
+    token: str,
+    deps: Dependencies,
+    *,
+    error_code: str,
+    error_message: str,
+    in_queue: bool,
+) -> bool:
+    """Stops retrying a job and says how to resume it.
+
+    in_queue=True: the last allowed delivery failed; returning False lets
+    SQS move the message to the dead-letter queue, from which a redrive
+    resumes the job. in_queue=False: the error would recur on every
+    attempt, so the message is acknowledged now and the job is resumed
+    with scripts/reprocess.py once the cause is fixed."""
+    if not deps.job_store.mark_dead_lettered(
+        job_id, token, error_code=error_code, error_message=error_message
+    ):
+        _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
+        return True
+    _log_error("job_dead_lettered", job_id=job_id, error_code=error_code, in_queue=in_queue)
+
+    if in_queue:
+        next_step = (
+            "The message is in the dead-letter queue. Fix the cause, then move it "
+            "back with scripts/redrive_dlq.sh."
+        )
+    else:
+        next_step = (
+            "This error would repeat on every attempt, so retrying stopped. Fix the "
+            f"cause, then run: scripts/reprocess.py --job-id {job_id}"
+        )
+    subject, body = notifications.build_notification_message(
+        job_id=job_id,
+        status=jobs.STATUS_DEAD_LETTERED,
+        valid_row_count=None,
+        rejected_row_count=None,
+        output_bucket=None,
+        output_summary_key=None,
+        output_rejected_key=None,
+        error_code=error_code,
+        error_message=error_message,
+        next_step=next_step,
+    )
+    try:
+        deps.notifier.publish(job_id=job_id, subject=subject, body=body)
+    except Exception as exc:  # noqa: BLE001 - best effort; the job record and alarm remain
+        _log_error("sns_publish_failed", job_id=job_id, error=type(exc).__name__)
+    return not in_queue
 
 
 def _ensure_notified(job_id: str, record: dict[str, Any], deps: Dependencies) -> bool:

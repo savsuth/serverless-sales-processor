@@ -35,6 +35,7 @@ def build_notification_message(
     error_message: str | None,
     duplicate_of: str | None = None,
     warning_counts: dict[str, int] | None = None,
+    next_step: str | None = None,
 ) -> tuple[str, str]:
     """Returns (subject, body). Reports are private S3 objects (no public
     access) -- the notification names their bucket/key so an authorized
@@ -71,6 +72,8 @@ def build_notification_message(
         lines.append(f"Error code: {error_code}")
     if error_message:
         lines.append(f"Error: {error_message}")
+    if next_step:
+        lines.append(f"Next step: {next_step}")
 
     return subject, "\n".join(lines)
 

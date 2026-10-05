@@ -21,8 +21,16 @@ to one processing attempt) with a `lease_expires_at` (epoch seconds).
     expired                   -> conditional steal keyed on the expiry
                                   check staying true (owned, or LOST_RACE
                                   if another worker stole it first)
-  * status=failed              -> conditional reclaim keyed on status
-                                  staying "failed" (owned, or LOST_RACE)
+  * status=failed or
+    dead_lettered              -> conditional reclaim keyed on status
+                                  staying the same (owned, or LOST_RACE)
+
+`failed` means an attempt did not finish and SQS will deliver the
+message again. `dead_lettered` means retrying stopped: either the last
+allowed delivery failed (the message is now in the dead-letter queue and
+a redrive resumes it), or processing hit an error that would recur on
+every attempt (the message was acknowledged; scripts/reprocess.py
+resumes it after a fix). Neither is final, so both can be reclaimed.
 
 Every state-changing write after the initial claim is itself conditioned
 on `lease_owner == <our token>`, so a worker whose lease has since been
@@ -67,6 +75,9 @@ STATUS_COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
 STATUS_VALIDATION_FAILED = "validation_failed"
 STATUS_DUPLICATE_CONTENT = "duplicate_content"
 STATUS_FAILED = "failed"
+STATUS_DEAD_LETTERED = "dead_lettered"
+
+RECLAIMABLE_STATUSES = frozenset({STATUS_FAILED, STATUS_DEAD_LETTERED})
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -196,8 +207,8 @@ class JobStore:
             if int(record["lease_expires_at"]) >= now:
                 return ClaimResult(status=ClaimStatus.ACTIVE_ELSEWHERE)
             condition = Attr("status").eq(STATUS_PROCESSING) & Attr("lease_expires_at").lt(now)
-        elif status == STATUS_FAILED:
-            condition = Attr("status").eq(STATUS_FAILED)
+        elif status in RECLAIMABLE_STATUSES:
+            condition = Attr("status").eq(status)
         else:
             return ClaimResult(status=ClaimStatus.LOST_RACE)
 
@@ -386,6 +397,22 @@ class JobStore:
             raise
 
     def mark_failed(self, job_id: str, token: str, *, error_code: str, error_message: str) -> bool:
+        """This attempt did not finish; SQS will deliver the message again."""
+        return self._mark_unfinished(
+            job_id, token, STATUS_FAILED, error_code=error_code, error_message=error_message
+        )
+
+    def mark_dead_lettered(
+        self, job_id: str, token: str, *, error_code: str, error_message: str
+    ) -> bool:
+        """Retrying has stopped; see the module docstring."""
+        return self._mark_unfinished(
+            job_id, token, STATUS_DEAD_LETTERED, error_code=error_code, error_message=error_message
+        )
+
+    def _mark_unfinished(
+        self, job_id: str, token: str, status: str, *, error_code: str, error_message: str
+    ) -> bool:
         from boto3.dynamodb.conditions import Attr
 
         try:
@@ -398,7 +425,7 @@ class JobStore:
                 ConditionExpression=Attr("lease_owner").eq(token),
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues={
-                    ":status": STATUS_FAILED,
+                    ":status": status,
                     ":updated_at": _now_iso(),
                     ":error_code": error_code,
                     ":error_message": sanitize_error_message(error_message),
