@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
@@ -94,6 +95,41 @@ def _log(level: int, message: str, **fields: Any) -> None:
     logger.log(level, json.dumps(payload, default=str))
 
 
+def _emit_attempt_metrics(
+    namespace: str, job_id: str, record: dict[str, Any], duration_ms: int
+) -> None:
+    """One CloudWatch Embedded Metric Format line per finished attempt:
+    CloudWatch turns it into metrics (dimension Status) with no API call
+    and no extra IAM permission. Counts only, never row content."""
+    status = record["status"]
+    payload = {
+        "level": "INFO",
+        "message": "job_attempt_metrics",
+        "job_id": job_id,
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": namespace,
+                    "Dimensions": [["Status"]],
+                    "Metrics": [
+                        {"Name": "JobAttempts", "Unit": "Count"},
+                        {"Name": "ValidRows", "Unit": "Count"},
+                        {"Name": "RejectedRows", "Unit": "Count"},
+                        {"Name": "ProcessingMs", "Unit": "Milliseconds"},
+                    ],
+                }
+            ],
+        },
+        "Status": status,
+        "JobAttempts": 1,
+        "ValidRows": int(record.get("valid_row_count", 0)),
+        "RejectedRows": int(record.get("rejected_row_count", 0)),
+        "ProcessingMs": duration_ms,
+    }
+    logger.info(json.dumps(payload, default=str))
+
+
 def _log_info(message: str, **fields: Any) -> None:
     _log(logging.INFO, message, **fields)
 
@@ -113,6 +149,7 @@ class Dependencies:
     # Must match the queue's redrive maxReceiveCount: the delivery with
     # this receive count is the last one before the dead-letter queue.
     max_receive_count: int = 5
+    metrics_namespace: str = "CsvSalesPipeline"
 
 
 def _default_dependencies() -> Dependencies:
@@ -136,6 +173,7 @@ def _default_dependencies() -> Dependencies:
         max_input_bytes=int(os.environ.get("MAX_INPUT_BYTES", MAX_INPUT_BYTES)),
         schema=schema,
         max_receive_count=int(os.environ.get("MAX_RECEIVE_COUNT", 5)),
+        metrics_namespace=os.environ.get("METRICS_NAMESPACE", "CsvSalesPipeline"),
     )
 
 
@@ -257,9 +295,29 @@ def _process_job(
 
     assert claim.status is jobs.ClaimStatus.OWNED
     assert claim.lease_token is not None
-    return _run_processing(
+    started = time.monotonic()
+    ok = _run_processing(
         job_id, bucket, key, version_id, claim.lease_token, deps, final_attempt=final_attempt
     )
+    _record_attempt(job_id, claim.lease_token, deps, started)
+    return ok
+
+
+def _record_attempt(job_id: str, token: str, deps: Dependencies, started: float) -> None:
+    """Emits metrics for this attempt's outcome, read back from the job
+    record so every path (success, failure, duplicate, dead letter) is
+    covered in one place. Skipped if another worker owns the job now."""
+    try:
+        record = deps.job_store.get(job_id)
+    except Exception as exc:  # noqa: BLE001 - metrics must never fail a job
+        _log_error("attempt_metrics_unavailable", job_id=job_id, error=type(exc).__name__)
+        return
+    if record is None or record.get("lease_owner") != token:
+        return
+    if record["status"] == jobs.STATUS_PROCESSING:
+        return
+    duration_ms = int((time.monotonic() - started) * 1000)
+    _emit_attempt_metrics(deps.metrics_namespace, job_id, record, duration_ms)
 
 
 def _run_processing(

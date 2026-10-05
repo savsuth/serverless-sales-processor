@@ -974,3 +974,60 @@ def test_claims_record_the_rules_version_they_ran_with(aws_stack):
     newer = jobs.JobStore(aws_stack["table"], rules=("sales", 4))
     assert newer.claim("job-1", INPUT_BUCKET, "a.csv", "v1").status is jobs.ClaimStatus.OWNED
     assert int(get_job(aws_stack, "job-1")["schema_version"]) == 4
+
+
+# --- Metrics (CloudWatch Embedded Metric Format) ---
+
+
+def _metric_lines(capsys):
+    lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    return [ln for ln in lines if ln.get("message") == "job_attempt_metrics"]
+
+
+def test_each_attempt_emits_one_metrics_line_with_its_outcome(aws_stack, capsys):
+    _, job_id = _upload_and_process(aws_stack, "sales.csv", MIXED_CSV)
+
+    (line,) = _metric_lines(capsys)
+    assert line["job_id"] == job_id
+    assert line["Status"] == "completed_with_rejections"
+    assert (line["JobAttempts"], line["ValidRows"], line["RejectedRows"]) == (1, 1, 1)
+    assert isinstance(line["ProcessingMs"], int)
+    (directive,) = line["_aws"]["CloudWatchMetrics"]
+    assert directive["Namespace"] == "CsvSalesPipeline"
+    assert directive["Dimensions"] == [["Status"]]
+    assert {m["Name"] for m in directive["Metrics"]} == {
+        "JobAttempts",
+        "ValidRows",
+        "RejectedRows",
+        "ProcessingMs",
+    }
+
+
+def test_failed_and_duplicate_attempts_are_counted_by_status(aws_stack, capsys):
+    version_id = upload(aws_stack["s3"], "a.csv", VALID_CSV)
+    flaky = FlakyObjectStorage(storage.S3Storage(aws_stack["s3"]), fail_get=True)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "a.csv", version_id))]}
+    handler.handle_event(event, make_deps(aws_stack, object_storage=flaky))
+    handler.handle_event(event, make_deps(aws_stack, notifier=FakeNotifier()))
+    _upload_and_process(aws_stack, "copy.csv", VALID_CSV)
+
+    assert [line["Status"] for line in _metric_lines(capsys)] == [
+        "failed",
+        "completed",
+        "duplicate_content",
+    ]
+
+
+def test_no_metrics_when_another_worker_has_taken_over(aws_stack, capsys):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+
+    def steal():
+        expire_lease(aws_stack, job_id)
+        jobs.JobStore(aws_stack["table"]).claim(job_id, INPUT_BUCKET, "sales.csv", version_id)
+
+    slow = HookedPutStorage(storage.S3Storage(aws_stack["s3"]), before_put=steal)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+    handler.handle_event(event, make_deps(aws_stack, object_storage=slow))
+
+    assert _metric_lines(capsys) == []

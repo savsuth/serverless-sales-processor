@@ -42,6 +42,7 @@ resource "aws_lambda_function" "processor" {
       MAX_INPUT_BYTES        = tostring(var.max_input_bytes)
       SCHEMA_NAME            = var.schema_name
       MAX_RECEIVE_COUNT      = tostring(var.sqs_max_receive_count)
+      METRICS_NAMESPACE      = local.metrics_namespace
       LOG_LEVEL              = "INFO"
     }
   }
