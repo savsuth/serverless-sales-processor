@@ -1,5 +1,6 @@
 import csv
 import dataclasses
+import gzip
 import hashlib
 import io
 from decimal import Decimal
@@ -260,3 +261,31 @@ def test_content_fingerprint_is_the_sha256_of_the_exact_bytes():
     data = VALID_CSV.encode("utf-8")
     result = process_csv(io.BytesIO(data), io.StringIO())
     assert result.content_sha256 == hashlib.sha256(data).hexdigest()
+
+
+# --- gzip input ---
+
+
+def test_gzip_input_gives_the_same_result_and_fingerprint_as_plain():
+    data = VALID_CSV.encode("utf-8")
+    plain = process_csv(io.BytesIO(data), io.StringIO())
+    zipped = process_csv(io.BytesIO(gzip.compress(data)), io.StringIO())
+
+    assert build_summary_dict(zipped) == build_summary_dict(plain)
+    assert zipped.content_sha256 == plain.content_sha256
+
+
+def test_corrupt_gzip_rejects_whole_file():
+    broken = gzip.compress(VALID_CSV.encode("utf-8"))[:-12]
+    with pytest.raises(MalformedCSVError) as exc_info:
+        process_csv(io.BytesIO(broken), io.StringIO())
+    assert exc_info.value.code == "invalid_gzip"
+
+
+def test_size_limit_applies_to_decompressed_bytes():
+    # 1 MB of rows compresses to a few KB: the limit must still stop it.
+    big = ("date,product,quantity,unit_price\n" + "2024-01-01,Widget,1,1.00\n" * 40000).encode()
+    compressed = gzip.compress(big)
+    assert len(compressed) < 100_000
+    with pytest.raises(InputTooLargeError):
+        process_csv(io.BytesIO(compressed), io.StringIO(), max_bytes=100_000)

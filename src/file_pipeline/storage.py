@@ -12,8 +12,17 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import IO, Any
 
+# Matched case-insensitively, so "Sales.CSV" is processed too. S3's own
+# event filter is case-sensitive, so the filtering happens here instead
+# (see infra/s3.tf).
+INPUT_SUFFIXES = (".csv", ".csv.gz")
+
 SUMMARY_KEY_TEMPLATE = "reports/{job_id}/summary.json"
 REJECTED_KEY_TEMPLATE = "reports/{job_id}/rejected_rows.csv"
+
+
+def is_input_key(key: str) -> bool:
+    return key.lower().endswith(INPUT_SUFFIXES)
 
 
 def summary_key(job_id: str) -> str:

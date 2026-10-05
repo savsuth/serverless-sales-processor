@@ -31,6 +31,11 @@ Design decisions (documented here because the task spec leaves them open):
 * Monetary values are Decimal throughout and serialized as plain decimal
   strings (no scientific notation, no float) to avoid float rounding
   error and precision loss.
+* A gzip-compressed file is recognized by its first two bytes (not its
+  name) and decompressed while streaming. The size limit and the content
+  fingerprint both apply to the decompressed CSV, so a compression bomb
+  is stopped at the limit and the same data compressed or not is the
+  same content.
 * rejected_rows.csv values are defended against spreadsheet formula
   injection: any field beginning with '=', '+', '-', '@', a tab, or a
   carriage return is prefixed with a leading apostrophe before being
@@ -43,9 +48,11 @@ from __future__ import annotations
 
 import csv
 import datetime
+import gzip
 import hashlib
 import io
 import re
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -142,6 +149,32 @@ class ProcessingResult:
             if name.startswith("total_") and name[len("total_") :] in self.totals:
                 return self.totals[name[len("total_") :]]
         raise AttributeError(name)
+
+
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+class _StreamReader(io.RawIOBase):
+    """Adapts any object with .read(n) (a file, an S3 StreamingBody) to
+    the raw-stream interface io.BufferedReader needs."""
+
+    def __init__(self, source: IO[bytes]) -> None:
+        self._source = source
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: bytearray) -> int:  # type: ignore[override]
+        data = self._source.read(len(b))
+        b[: len(data)] = data
+        return len(data)
+
+
+def _decompressed(binary_stream: IO[bytes]) -> IO[bytes]:
+    buffered = io.BufferedReader(_StreamReader(binary_stream))
+    if buffered.peek(len(GZIP_MAGIC))[: len(GZIP_MAGIC)] == GZIP_MAGIC:
+        return gzip.GzipFile(fileobj=buffered, mode="rb")
+    return buffered
 
 
 class _CountingRawReader(io.RawIOBase):
@@ -291,7 +324,7 @@ def process_csv(
     written to it is incomplete and must be discarded by the caller.
     """
     schema = schema or load_schema()
-    raw = _CountingRawReader(binary_stream, max_bytes)
+    raw = _CountingRawReader(_decompressed(binary_stream), max_bytes)
     try:
         text_stream = _open_text_stream(raw)
         reader = csv.reader(text_stream)
@@ -355,6 +388,10 @@ def process_csv(
         raise MalformedCSVError("invalid_encoding", str(exc)) from exc
     except csv.Error as exc:
         raise MalformedCSVError("csv_parse_error", str(exc)) from exc
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise MalformedCSVError(
+            "invalid_gzip", "File starts like gzip but could not be decompressed"
+        ) from exc
 
     error_code = error_message = None
     row_count = valid_row_count + rejected_row_count

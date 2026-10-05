@@ -29,7 +29,14 @@ GOLDEN = Path(__file__).parent / "golden"
 REPORT_FILES = ("summary.json", "rejected_rows.csv")
 UPDATE = os.environ.get("UPDATE_GOLDEN") == "1"
 
-SAMPLE_PATHS = sorted(SAMPLES.glob("*.csv"))
+SAMPLE_PATHS = sorted([*SAMPLES.glob("*.csv"), *SAMPLES.glob("*.csv.gz")])
+
+
+def _sample_id(path: Path) -> str:
+    """valid_sales.csv -> valid_sales; valid_sales.csv.gz -> valid_sales_gz."""
+    if path.name.endswith(".csv.gz"):
+        return path.name.removesuffix(".csv.gz") + "_gz"
+    return path.stem
 
 INPUT_BUCKET = "golden-input"
 OUTPUT_BUCKET = "golden-output"
@@ -63,21 +70,23 @@ def test_every_sample_has_a_snapshot():
     if UPDATE:
         pytest.skip("snapshots are being regenerated")
     assert SAMPLE_PATHS
-    assert {p.stem for p in SAMPLE_PATHS} == {p.name for p in GOLDEN.iterdir() if p.is_dir()}
+    assert {_sample_id(p) for p in SAMPLE_PATHS} == {
+        p.name for p in GOLDEN.iterdir() if p.is_dir()
+    }
 
 
-@pytest.mark.parametrize("sample", SAMPLE_PATHS, ids=lambda p: p.stem)
+@pytest.mark.parametrize("sample", SAMPLE_PATHS, ids=_sample_id)
 def test_local_cli_output_matches_snapshot(sample, tmp_path):
     out = tmp_path / "out"
     exit_code = main(["--input", str(sample), "--output-dir", str(out)])
     reports = {name: (out / name).read_bytes() for name in REPORT_FILES if (out / name).exists()}
 
     if UPDATE:
-        _write_golden(sample.stem, exit_code, reports)
+        _write_golden(_sample_id(sample), exit_code, reports)
         return
 
-    assert exit_code == _golden_exit_code(sample.stem)
-    assert reports == _golden_reports(sample.stem)
+    assert exit_code == _golden_exit_code(_sample_id(sample))
+    assert reports == _golden_reports(_sample_id(sample))
 
 
 @pytest.fixture
@@ -108,7 +117,7 @@ def moto_stack():
         yield s3, table, deps
 
 
-@pytest.mark.parametrize("sample", SAMPLE_PATHS, ids=lambda p: p.stem)
+@pytest.mark.parametrize("sample", SAMPLE_PATHS, ids=_sample_id)
 def test_lambda_output_matches_snapshot(sample, moto_stack):
     if UPDATE:
         pytest.skip("snapshots are being regenerated")
@@ -142,7 +151,7 @@ def test_lambda_output_matches_snapshot(sample, moto_stack):
 
     job_id = jobs.compute_job_id(INPUT_BUCKET, key, version_id)
     job = table.get_item(Key={"job_id": job_id})["Item"]
-    expected_reports = _golden_reports(sample.stem)
+    expected_reports = _golden_reports(_sample_id(sample))
 
     if not expected_reports:
         assert job["status"] == "validation_failed"

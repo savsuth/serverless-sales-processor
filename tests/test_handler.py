@@ -2,6 +2,7 @@
 emulation -- no real AWS credentials or network calls are used anywhere
 in this file (moto intercepts every boto3 call)."""
 
+import gzip
 import hashlib
 import json
 from decimal import Decimal
@@ -741,3 +742,43 @@ def test_failed_and_duplicate_jobs_write_no_rows_for_athena(aws_stack):
     _upload_and_process(aws_stack, "all-bad.csv", ALL_INVALID_CSV)  # validation_failed
 
     assert _curated_keys(aws_stack) == [f"curated/sales/month=2024-01/{first_id}.json.gz"]
+
+
+# --- Which objects are inputs ---
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        ("sales.csv", True),
+        ("SALES.CSV", True),
+        ("Q1/Sales.Csv", True),
+        ("sales.csv.gz", True),
+        ("SALES.CSV.GZ", True),
+        ("notes.txt", False),
+        ("sales.csv.bak", False),
+        ("sales.gz", False),
+    ],
+)
+def test_input_keys_are_matched_case_insensitively(key, expected):
+    assert storage.is_input_key(key) is expected
+
+
+def test_uppercase_extension_is_processed(aws_stack):
+    _, job_id = _upload_and_process(aws_stack, "SALES.CSV", VALID_CSV)
+    assert get_job(aws_stack, job_id)["status"] == "completed"
+
+
+def test_non_csv_object_is_ignored_without_a_job_record(aws_stack):
+    result, job_id = _upload_and_process(aws_stack, "notes.txt", b"not a csv")
+    assert result == {"batchItemFailures": []}
+    assert "Item" not in aws_stack["table"].get_item(Key={"job_id": job_id})
+
+
+def test_gzip_upload_is_processed_and_counts_as_the_same_content(aws_stack):
+    _, plain_id = _upload_and_process(aws_stack, "sales.csv", VALID_CSV)
+    _, gz_id = _upload_and_process(aws_stack, "sales.csv.gz", gzip.compress(VALID_CSV))
+
+    gz_job = get_job(aws_stack, gz_id)
+    assert gz_job["status"] == "duplicate_content"
+    assert gz_job["duplicate_of"] == plain_id

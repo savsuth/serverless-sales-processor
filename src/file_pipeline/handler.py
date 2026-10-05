@@ -204,6 +204,10 @@ def _process_s3_record(s3_record: dict, deps: Dependencies, *, message_id: str) 
         _log_error("malformed_s3_event_record", sqs_message_id=message_id, error=str(exc))
         return False
 
+    if not storage.is_input_key(key):
+        _log_info("ignoring_non_csv_object", sqs_message_id=message_id, bucket=bucket)
+        return True
+
     job_id = jobs.compute_job_id(bucket, key, version_id)
     return _process_job(job_id, bucket, key, version_id, deps)
 
