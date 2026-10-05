@@ -11,40 +11,62 @@ AWS Lambda function triggered by S3 object-creation events. Each upload
 is assigned a deterministic job ID derived from the object's bucket, key,
 and version, claimed atomically in DynamoDB, and tracked through to a
 terminal status and an SNS notification, so a retried or duplicated event
-cannot silently reprocess a job that already completed. The repository
-contains the application, its test suite, and the Terraform configuration
-used to deploy the AWS stack.
+cannot silently reprocess a job that already completed. The same file
+content uploaded twice is recognized and not counted again, and every
+valid row of a completed job is written as queryable data for Amazon
+Athena. The repository contains the application, its test suite, and the
+Terraform configuration used to deploy the AWS stack.
 
 ## Features
 
 - Streaming CSV validation: required-column checks, per-row validation,
   and duplicate-header detection without loading the whole file into
   memory.
+- Schema-driven: columns, validation rules, and totals are defined in a
+  JSON schema file (`src/file_pipeline/schemas/sales.json`), so the same
+  engine can process other kinds of CSV.
 - Decimal-based revenue calculations using Python's `Decimal` type instead
   of binary floating point.
+- A rejection-rate limit: a file with more than half its rows rejected
+  fails as a whole instead of producing untrustworthy totals.
+- Duplicate-upload detection: the same file content uploaded again, under
+  any name, is recorded as a duplicate of the original job and never
+  counted twice.
+- Queryable history: valid rows from every completed job, partitioned by
+  month, as an Athena table with saved example queries.
 - A local CLI that produces the same output format as the AWS deployment,
   so behavior can be verified without AWS access.
 - An AWS Lambda handler with idempotent, at-least-once job processing:
   deterministic job IDs, DynamoDB-backed claims with expiring leases, and
   safe retries.
 - Terraform configuration for the full AWS stack (S3, SQS, Lambda,
-  DynamoDB, SNS, CloudWatch), plus a separate bootstrap stack for Terraform
-  state.
+  DynamoDB, SNS, CloudWatch, Glue, Athena), plus a separate bootstrap
+  stack for Terraform state.
+- Snapshot tests that pin every sample's exact output bytes, and
+  property-based tests (Hypothesis) that check invariants over thousands
+  of generated files.
 - GitHub Actions workflow for linting and tests on pushes to `main` and on
   every pull request, and a separate, manually triggered workflow for
   deployment.
+- Design decisions recorded in [`docs/decisions/`](docs/decisions/).
 
 ## Architecture
 
-![CSV sales processing architecture: an uploaded CSV moves from an S3 input bucket through an SQS queue to a Lambda processor, which claims the job in DynamoDB, writes a report to an S3 output bucket, and publishes a completion notice to SNS, with a dead-letter queue and CloudWatch alarms handling failures.](docs/architecture.svg)
+![CSV sales processing architecture: an uploaded CSV moves from an S3 input bucket through an SQS queue to a Lambda processor, which claims the job and checks for duplicate content in DynamoDB, writes reports and curated rows to an S3 output bucket that Athena queries by month, and publishes a completion notice to SNS, with a dead-letter queue and CloudWatch alarms handling failures.](docs/architecture.svg)
 
 On the normal path, a Lambda invocation reads the exact object version
 referenced by the triggering S3 event, validates and aggregates the CSV,
-writes two report files to the output bucket, updates the DynamoDB job
-record, and publishes a completion notification. Malformed input, a
+checks that its content is new, writes two report files and the curated
+rows to the output bucket, updates the DynamoDB job record, and publishes
+a completion notification. Malformed input, duplicate content, a
 duplicate delivery of an already-finished job, and internal errors each
-take a different, shorter path -- see
-[Reliability and limitations](#reliability-and-limitations).
+take a different, shorter path:
+
+![Job status lifecycle: a job is claimed into processing under a lease, then ends as completed, validation failed, or duplicate content, or drops to a retryable failed status that redelivery reclaims; an expired lease is taken over by another worker, and the fifth failed delivery goes to the dead-letter queue.](docs/job-lifecycle.svg)
+
+See [Reliability and limitations](#reliability-and-limitations) and
+[decision record 0004](docs/decisions/0004-expiring-lease-claims.md) for
+how claims and leases work.
 
 ## Local Quick Start
 
@@ -72,19 +94,27 @@ Exit codes:
 |---|---|
 | `0` | Job completed (with or without rejected rows) |
 | `1` | The whole file was rejected (malformed CSV or over the size limit) -- no output is written |
-| `2` | The file was structurally valid but zero rows passed validation (`validation_failed`) -- `summary.json` and `rejected_rows.csv` are still written, so the rejection reasons are visible |
+| `2` | The file was structurally valid but failed validation (`validation_failed`): zero rows passed, or more than the schema's limit (50% for sales) were rejected. `summary.json` and `rejected_rows.csv` are still written, so the rejection reasons are visible, and the reason is printed to stderr |
 
 Other sample files, each covering one validation scenario, are in
 [`samples/`](samples/): `mixed_valid_invalid.csv`, `missing_columns.csv`,
-`all_invalid.csv`, and `malformed.csv` (a duplicate-header file).
+`all_invalid.csv`, `high_rejection_rate.csv` (3 of 5 rows rejected), and
+`malformed.csv` (a duplicate-header file).
+
+To process a different kind of CSV, pass `--schema` with a bundled schema
+name or a path to a schema file (see [Schemas](#schemas)):
+
+```bash
+python -m file_pipeline.local --input inventory.csv --output-dir out/ --schema my_schema.json
+```
 
 A guided walkthrough (valid upload, then an all-invalid file and how to read
 its rejection reasons) is in [`scripts/demo_local.sh`](scripts/demo_local.sh).
 
 ## Input Requirements and Example Output
 
-Required columns (matched case-insensitively, surrounding whitespace
-trimmed):
+Required columns of the default `sales` schema (matched
+case-insensitively, surrounding whitespace trimmed):
 
 | Column | Requirement |
 |---|---|
@@ -136,12 +166,14 @@ rejection for that row, and can absorb what looks like a subsequent data
 row into the same field instead of parsing it separately. An individual
 invalid row is otherwise recorded in `rejected_rows.csv` with a reason
 and excluded from the totals, while the rest of the file is still
-processed. If every row turns out invalid, the job status is also
-`validation_failed`, but `summary.json` and `rejected_rows.csv` are still
-produced in that case, showing zero valid rows and why each one failed.
-This distinction matters when retrieving reports: a file-level rejection
-produces no report to download, while a structurally valid file with
-zero valid rows does.
+processed. If every row turns out invalid (`no_valid_rows`), or more than
+half of them do (`rejection_rate_exceeded`; the limit is the schema's
+`max_rejection_rate`, and exactly 50% still completes), the job status is
+also `validation_failed`, but `summary.json` and `rejected_rows.csv` are
+still produced, showing the counts and why each row failed. This
+distinction matters when retrieving reports: a file-level rejection
+produces no report to download, while a structurally valid file that
+failed validation does.
 
 Extra columns are allowed and ignored for valid rows. For a rejected row,
 they are retained in `rejected_rows.csv`, which echoes the raw row,
@@ -172,14 +204,59 @@ malformed, since the column a value belongs to would be ambiguous. A row
 with a different number of fields than the header is rejected
 individually, not treated as a file-level error.
 
-In the AWS deployment, a file-level rejection and an all-rows-invalid
-file are both recorded with the same `validation_failed` status on the
-DynamoDB job record; the field that distinguishes them is the presence of
-`output_summary_key` / `output_rejected_key` (absent for a file-level
-rejection, present when a report was produced). The local CLI
-distinguishes them directly, through its exit code (`1` vs `2`, above).
+In the AWS deployment, a file-level rejection and a structurally valid
+file that failed validation are both recorded with the same
+`validation_failed` status on the DynamoDB job record. `error_code` says
+why (`missing_required_columns`, `duplicate_header`, `input_too_large`,
+... for a file-level rejection; `no_valid_rows` or
+`rejection_rate_exceeded` otherwise), and `output_summary_key` /
+`output_rejected_key` are present only when a report was produced. The
+local CLI distinguishes them directly, through its exit code (`1` vs
+`2`, above).
+
+Final job statuses: `completed`, `completed_with_rejections`,
+`validation_failed`, and `duplicate_content` (see
+[Reliability and limitations](#reliability-and-limitations)).
 
 </details>
+
+## Schemas
+
+What a valid row is, and what gets added up, is defined by a JSON schema
+file. The default, [`sales.json`](src/file_pipeline/schemas/sales.json):
+
+```json
+{
+  "name": "sales",
+  "columns": [
+    { "name": "date", "type": "date" },
+    { "name": "product", "type": "string", "required": true },
+    { "name": "quantity", "type": "integer", "positive": true },
+    { "name": "unit_price", "type": "decimal", "non_negative": true }
+  ],
+  "aggregation": {
+    "group_by": "product",
+    "measures": [
+      { "name": "quantity", "multiply": ["quantity"] },
+      { "name": "revenue", "multiply": ["quantity", "unit_price"], "total": true }
+    ]
+  },
+  "max_rejection_rate": 0.5,
+  "curated": { "partition_by_month": "date" }
+}
+```
+
+Column types are `date`, `string`, `integer`, and `decimal`, each with a
+few options; rejection codes are generated from the column name
+(`invalid_<name>`, `empty_<name>`, `non_positive_<name>`, ...). Each
+measure adds up, per value of `group_by`, the product of its listed
+columns; `total: true` also reports a grand total (`total_revenue`). The
+full format is documented in
+[`schema.py`](src/file_pipeline/schema.py), and an invalid schema
+is rejected with a specific error before any file is processed.
+
+The CLI takes `--schema`; the Lambda uses the `schema_name` Terraform
+variable (one schema per deployment).
 
 ## AWS Deployment and Configuration
 
@@ -192,7 +269,7 @@ Two separate Terraform roots:
 | Root | Purpose |
 |---|---|
 | `infra/bootstrap` | Creates the S3 bucket that holds the main stack's Terraform state. Uses local state itself. |
-| `infra` | The application stack: S3 buckets, SQS, Lambda, DynamoDB, SNS, CloudWatch. Uses an S3 backend. |
+| `infra` | The application stack: S3 buckets, SQS, Lambda, DynamoDB, SNS, CloudWatch, Glue, Athena. Uses an S3 backend. |
 
 `aws_region` and `project_name` must be set to the same values in both
 roots. `infra/bootstrap` names the state bucket and, when GitHub OIDC is
@@ -245,6 +322,10 @@ list with defaults):
 | `aws_region` | Region for every resource (default `us-east-2`). Some AWS accounts restrict which regions general workloads may run in via an AWS Organizations Service Control Policy; if resource creation fails with a region-specific authorization error, check for such a policy and set `aws_region` accordingly. |
 | `notification_email` | Subscribes an email address to the SNS topic. Empty by default. |
 | `lambda_max_concurrency` | Caps concurrent Lambda invocations from the SQS trigger (2-1000, default 5). |
+| `schema_name` | Bundled schema the Lambda uses (default `sales`); also names the Athena table. |
+| `enable_athena` | Creates the Glue table, Athena workgroup, and query-results bucket (default `true`, when the schema has a `curated` section). |
+| `athena_bytes_scanned_cutoff` | Athena cancels any single query that would scan more than this (default 1 GiB). |
+| `athena_month_range` | Months visible to Athena queries (default `2000-01,NOW`). |
 | `enable_budget_alert`, `budget_limit_usd`, `budget_alert_email` | Optional AWS Budget alert. |
 
 Set these in a gitignored `infra/terraform.tfvars`. `infra/bootstrap` has
@@ -286,9 +367,17 @@ workflow is updated to pass through.
 
 The Lambda's execution role is scoped to project resources and the
 relevant prefixes on them: reading the input bucket, writing the output
-bucket under `reports/`, consuming its own SQS queue, reading and writing
-its own DynamoDB table, publishing to its own SNS topic, and writing to
-its own CloudWatch log group -- see [`infra/iam.tf`](infra/iam.tf).
+bucket under `reports/` and `curated/`, consuming its own SQS queue,
+reading and writing its own DynamoDB table, publishing to its own SNS
+topic, and writing to its own CloudWatch log group -- see
+[`infra/iam.tf`](infra/iam.tf).
+
+The optional GitHub Actions deploy role is defined in `infra/bootstrap`,
+outside the stack it deploys, so it can never widen its own permissions.
+The flip side: when the application stack starts using a new AWS
+service, the role needs a matching grant in
+[`infra/bootstrap/github_oidc.tf`](infra/bootstrap/github_oidc.tf),
+applied from a laptop, before a GitHub deploy can create it.
 
 ## AWS Usage
 
@@ -313,6 +402,35 @@ scripts/check_job.sh <job-table-name> <job-id>
 scripts/fetch_report.sh <output-bucket-name> <job-id> ./downloaded-report/
 ```
 
+### Querying with Athena
+
+Every valid row of every completed job is also written to
+`curated/sales/month=YYYY-MM/{job_id}.json.gz` in the output bucket and
+exposed as the table `sales` in the Glue database `csv_sales_pipeline`.
+Each row has the CSV's columns, its `revenue`, and lineage: the
+`job_id` it came from and its `source_row_number` in that file. Failed
+and duplicate uploads never reach the table, so sums are never inflated.
+
+In the Athena console, choose the `csv-sales-pipeline-analytics`
+workgroup (`terraform output -raw athena_workgroup_name`); the queries in
+[`docs/queries/sales/`](docs/queries/sales/) are saved there. For
+example:
+
+```sql
+SELECT month, product, SUM(quantity) AS quantity, SUM(revenue) AS revenue
+FROM sales
+GROUP BY month, product
+ORDER BY month, revenue DESC;
+```
+
+New months are queryable as soon as their first file lands (partition
+projection, no crawler). Filtering on `month` limits what Athena reads.
+The workgroup cancels any query that would scan more than 1 GiB, and
+query results are deleted after 7 days. Uploads processed before curated
+output existed are not in the table; re-upload such a file once to add
+it (it has no content fingerprint, so it is not treated as a duplicate).
+Design notes: [decision record 0010](docs/decisions/0010-curated-json-lines-for-athena.md).
+
 ## Reliability and Limitations
 
 - **Job identity.** The job ID is deterministic: `sha256(bucket + "\n" +
@@ -324,6 +442,15 @@ scripts/fetch_report.sh <output-bucket-name> <job-id> ./downloaded-report/
   `completed_with_rejections`, or `validation_failed`) does not reprocess
   the CSV. A failed or interrupted attempt is retried and can genuinely
   process the CSV again -- that is the intended recovery path.
+- **Duplicate content.** A new upload of the same bytes (same or
+  different key) is a new S3 version and therefore a new job, but its
+  SHA-256 matches a job that already completed, so it ends as
+  `duplicate_content` with `duplicate_of` naming the original, writes no
+  reports or curated rows, and says so in its notification. If the
+  original is still in progress, the duplicate is retried until the
+  original finishes. Only files that produced totals are fingerprinted,
+  and content is compared byte for byte -- see
+  [decision record 0009](docs/decisions/0009-duplicate-content-fingerprints.md).
 - **Lease-conditioned writes.** DynamoDB job-record updates after the
   initial claim require the matching lease token, so a worker whose lease
   has been taken over by a newer attempt cannot overwrite that attempt's
@@ -333,9 +460,11 @@ scripts/fetch_report.sh <output-bucket-name> <job-id> ./downloaded-report/
   through two separate `PutObject` calls, not one atomic operation, at
   fixed keys, so a retry corrects a partial write from an earlier failed
   attempt. Because the output bucket is versioned, each retry's writes add
-  new object versions rather than replacing history. Wait for the job to
-  reach a terminal status (`completed`, `completed_with_rejections`, or
-  `validation_failed`) before retrieving its report.
+  new object versions rather than replacing history. Curated files are
+  written in the same step and are byte-for-byte deterministic, so a
+  retry rewrites them identically. Wait for the job to reach a terminal
+  status (`completed`, `completed_with_rejections`, `validation_failed`,
+  or `duplicate_content`) before retrieving its report.
 - **Notifications.** Publishing to SNS and recording that success in
   DynamoDB are two separate operations, so a subscriber can occasionally
   receive a duplicate notification for the same job. A successful SNS
@@ -353,24 +482,49 @@ Tests run without real AWS credentials or network calls: pure-Python logic
 is tested directly, and the Lambda handler's AWS interactions are tested
 against [moto](https://github.com/getmoto/moto)'s in-memory AWS emulation,
 covering duplicate and concurrent delivery, lease expiry and recovery,
-transient AWS errors, partial-output-write retry, SNS-failure retry, S3
-keys with spaces and escaped characters, and retrieval of a specific
-object version.
+duplicate content, transient AWS errors, partial-output-write retry,
+SNS-failure retry, S3 keys with spaces and escaped characters, and
+retrieval of a specific object version.
+
+Two kinds of test guard the processing logic as a whole:
+
+- **Snapshot tests** (`tests/test_golden.py`) run every file in
+  `samples/` through both the CLI and the Lambda and compare the output
+  byte for byte with `tests/golden/`. After an intended output change,
+  regenerate with `UPDATE_GOLDEN=1 pytest tests/test_golden.py` and
+  review the diff.
+- **Property-based tests** (`tests/test_properties.py`) use
+  [Hypothesis](https://hypothesis.works/) to generate thousands of
+  random sales files whose correct result is known row by row, and check
+  that totals match an independent calculation, row order never changes
+  the summary, every rejection is reported with its reason, the curated
+  rows add up to the report, and CLI and Lambda output are identical.
+
+`tests/test_terraform_schema.py` evaluates the Athena column list in
+Terraform (offline, with `terraform console`) and checks that it matches
+the Python side; it is skipped when Terraform is not installed.
 
 ## Project Structure
 
 ```
 src/file_pipeline/
   processor.py      # CSV validation and aggregation (no AWS dependency)
+  schema.py         # Schema file format and validation
+  schemas/          # Bundled schemas (sales.json)
+  curated.py        # Curated rows for Athena
   local.py          # CLI runner
   storage.py        # S3 reads/writes
-  jobs.py           # DynamoDB job state, claims, leases
+  jobs.py           # DynamoDB job state, claims, leases, content fingerprints
   notifications.py  # SNS
   handler.py        # SQS-triggered Lambda entry point
 tests/              # pytest; moto for AWS interaction tests
+tests/golden/       # Snapshot outputs for every sample
 samples/            # Example CSVs, one per validation scenario
-infra/              # Terraform (main stack)
+infra/              # Terraform (main stack, incl. Glue/Athena)
 infra/bootstrap/    # Terraform (state bucket, optional OIDC role)
+docs/decisions/     # Design decision records
+docs/queries/       # Example Athena queries (saved in the workgroup)
+docs/diagrams/      # Diagram sources (HTML); exported SVGs are in docs/
 scripts/            # Upload, status, report, redrive, teardown helpers
 .github/workflows/  # CI (always) and deploy (manual, gated)
 ```

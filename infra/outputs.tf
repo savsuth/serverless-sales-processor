@@ -24,7 +24,7 @@ output "processing_queue_arn" {
 }
 
 output "dead_letter_queue_url" {
-  description = "Inspect this queue for messages that exhausted all retries -- see README's redrive runbook."
+  description = "Messages that exhausted all retries land here. Fix the cause, then move them back with scripts/redrive_dlq.sh."
   value       = aws_sqs_queue.dlq.id
 }
 

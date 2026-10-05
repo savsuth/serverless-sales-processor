@@ -1,7 +1,5 @@
 # Optional: a budget ALERT only. It sends an email when spend crosses the
 # threshold -- it does not stop, throttle, or cap spending in any way.
-# See README's "Cost drivers" section for what actually drives this
-# project's AWS bill.
 #
 # This tracks the whole account's spend, not just this project's
 # resources: scoping a budget to a tag requires first activating that tag

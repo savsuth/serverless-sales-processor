@@ -11,8 +11,8 @@ requires `FunctionResponseTypes: ["ReportBatchItemFailures"]` on the SQS
 event source mapping (see infra/). Any messageId NOT listed is deleted
 from the queue by Lambda; anything listed becomes visible again after the
 visibility timeout and is retried (or moves to the DLQ once
-maxReceiveCount is exhausted -- see jobs.py's docstring and README's
-retry/redrive section for how to recognize and recover that).
+maxReceiveCount is exhausted -- see jobs.py's docstring and
+docs/decisions/0002-sqs-between-s3-and-lambda.md for how to recover that).
 """
 
 from __future__ import annotations
