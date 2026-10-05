@@ -323,3 +323,52 @@ def test_product_names_differing_only_in_case_are_one_product():
     summary = build_summary_dict(result)
     # Reported under the alphabetically first spelling, whatever the row order.
     assert summary["by_product"] == {"WIDGET": {"quantity": 6, "revenue": "6.00"}}
+
+
+# --- Warnings (never change totals or status) ---
+
+
+def test_repeated_rows_are_flagged_comparing_numbers_by_value_and_names_without_case():
+    csv_text = (
+        "date,product,quantity,unit_price\n"
+        "2024-01-01,Widget,1,9.99\n"
+        "2024-01-01,WIDGET,1,9.990\n"
+        "2024-01-01,Widget,2,9.99\n"
+    )
+    result, _ = _run(csv_text)
+    assert result.warnings["duplicate_rows"] == {"count": 1, "row_numbers": [2]}
+    assert result.valid_row_count == 3 and result.status == "completed"
+
+
+def test_price_far_from_the_products_median_is_flagged():
+    csv_text = "date,product,quantity,unit_price\n" + "".join(
+        f"2024-01-0{day},Widget,1,{price}\n"
+        for day, price in [(1, "9.99"), (2, "10.49"), (3, "999.00"), (4, "0.50"), (5, "9.49")]
+    )
+    result, _ = _run(csv_text)
+    assert result.warnings["outliers"] == {
+        "column": "unit_price",
+        "count": 2,
+        "row_numbers": [3, 4],
+    }
+
+
+def test_outliers_need_at_least_three_rows_and_a_positive_median():
+    two_rows = "date,product,quantity,unit_price\n2024-01-01,A,1,1.00\n2024-01-02,A,1,500.00\n"
+    zeros = "date,product,quantity,unit_price\n" + "2024-01-01,B,1,0\n" * 2 + "2024-01-02,B,1,5\n"
+    assert _run(two_rows)[0].warnings["outliers"]["count"] == 0
+    assert _run(zeros)[0].warnings["outliers"]["count"] == 0
+
+
+def test_warning_row_numbers_are_capped_but_the_count_is_exact():
+    csv_text = "date,product,quantity,unit_price\n" + "2024-01-01,Widget,1,1.00\n" * 30
+    result, _ = _run(csv_text)
+    warning = result.warnings["duplicate_rows"]
+    assert warning["count"] == 29
+    assert warning["row_numbers"] == list(range(2, 22))
+
+
+def test_schema_without_warnings_adds_no_warnings_to_the_summary():
+    schema = dataclasses.replace(load_schema(), warn_duplicate_rows=False, outliers=None)
+    result = process_csv(io.BytesIO(VALID_CSV.encode()), io.StringIO(), schema=schema)
+    assert "warnings" not in build_summary_dict(result)

@@ -252,3 +252,39 @@ def test_delimiters_default_to_comma():
 def test_invalid_delimiters_are_rejected(delimiters):
     with pytest.raises(SchemaError):
         parse_schema({**INVENTORY_SCHEMA, "delimiters": delimiters})
+
+
+def test_bundled_sales_schema_warns_about_repeats_and_price_outliers():
+    schema = load_schema()
+    assert schema.warn_duplicate_rows is True
+    assert (schema.outliers.column, schema.outliers.per, schema.outliers.factor) == (
+        "unit_price",
+        "product",
+        Decimal("10"),
+    )
+
+
+@pytest.mark.parametrize(
+    "warnings",
+    [
+        {"duplicate_rows": "yes"},
+        {"outliers": {"column": "sku", "per": "counted_on", "factor": 10}},
+        {"outliers": {"column": "units", "per": "unit_cost", "factor": 10}},
+        {"outliers": {"column": "units", "per": "sku", "factor": 1}},
+        {"outliers": {"column": "units", "per": "sku", "factor": True}},
+        {"outliers": {"column": "units", "per": "sku"}},
+        {"unknown": True},
+    ],
+    ids=[
+        "duplicate_rows_not_boolean",
+        "outlier_column_not_numeric",
+        "outlier_per_not_groupable",
+        "factor_not_above_one",
+        "factor_boolean",
+        "factor_missing",
+        "unknown_key",
+    ],
+)
+def test_invalid_warnings_are_rejected(warnings):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "warnings": warnings})

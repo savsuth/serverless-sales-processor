@@ -340,6 +340,7 @@ def _run_processing(
         error_code=result.error_code,
         error_message=result.error_message,
         content_sha256=result.content_sha256,
+        warning_counts=_warning_counts(result.warnings),
     )
     if not owned:
         _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
@@ -356,7 +357,12 @@ def _run_processing(
         output_rejected_key=rejected_key,
         error_code=result.error_code,
         error_message=result.error_message,
+        warning_counts=_warning_counts(result.warnings),
     )
+
+
+def _warning_counts(warnings: dict[str, Any]) -> dict[str, int]:
+    return {name: warning["count"] for name, warning in warnings.items()}
 
 
 def _finish_validation_failed(
@@ -457,6 +463,7 @@ def _ensure_notified(job_id: str, record: dict[str, Any], deps: Dependencies) ->
         error_code=record.get("error_code"),
         error_message=record.get("error_message"),
         duplicate_of=record.get("duplicate_of"),
+        warning_counts=record.get("warning_counts"),
     )
 
 
@@ -473,6 +480,7 @@ def _notify_and_ack(
     error_code: str | None,
     error_message: str | None,
     duplicate_of: str | None = None,
+    warning_counts: dict[str, int] | None = None,
 ) -> bool:
     subject, body = notifications.build_notification_message(
         job_id=job_id,
@@ -485,6 +493,7 @@ def _notify_and_ack(
         error_code=error_code,
         error_message=error_message,
         duplicate_of=duplicate_of,
+        warning_counts=warning_counts,
     )
     try:
         deps.notifier.publish(job_id=job_id, subject=subject, body=body)

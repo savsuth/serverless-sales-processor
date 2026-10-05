@@ -181,13 +181,17 @@ def _sanitized(value: str) -> str:
 # --- Properties ------------------------------------------------------------
 
 
+def _without_warnings(summary: dict) -> dict:
+    return {k: v for k, v in summary.items() if k != "warnings"}
+
+
 @settings(max_examples=300, deadline=None)
 @given(sales_files)
 def test_totals_match_an_independent_calculation(rows):
     result, _ = _process(rows)
     expected = _expected_summary(rows)
 
-    assert build_summary_dict(result) == expected
+    assert _without_warnings(build_summary_dict(result)) == expected
     assert result.status == _expected_status(
         expected["valid_row_count"], expected["rejected_row_count"]
     )
@@ -221,7 +225,14 @@ def test_row_order_does_not_change_the_summary(rows, data):
     original, _ = _process(rows)
     reordered, _ = _process(shuffled)
 
-    assert summary_json_bytes(reordered) == summary_json_bytes(original)
+    # Warnings name row numbers, which do move with the rows; their counts
+    # must not.
+    assert _without_warnings(build_summary_dict(reordered)) == _without_warnings(
+        build_summary_dict(original)
+    )
+    assert {k: w["count"] for k, w in reordered.warnings.items()} == {
+        k: w["count"] for k, w in original.warnings.items()
+    }
 
 
 @settings(max_examples=300, deadline=None)
@@ -362,3 +373,20 @@ def test_grouping_curated_rows_like_the_athena_queries_reproduces_the_report(row
         for name, quantity, revenue in groups.values()
     }
     assert by_product == build_summary_dict(result)["by_product"]
+
+
+@settings(max_examples=200, deadline=None)
+@given(sales_files)
+def test_repeated_row_count_equals_valid_rows_minus_distinct_rows(rows):
+    result, _ = _process(rows)
+    distinct = {
+        (
+            r.fields[0].strip(),
+            r.product.lower(),
+            r.quantity,
+            r.unit_price.normalize(),
+        )
+        for r in rows
+        if r is not BLANK and r.reason is None
+    }
+    assert result.warnings["duplicate_rows"]["count"] == result.valid_row_count - len(distinct)

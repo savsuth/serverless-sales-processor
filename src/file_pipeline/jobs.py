@@ -304,6 +304,7 @@ class JobStore:
         error_code: str | None = None,
         error_message: str | None = None,
         content_sha256: str | None = None,
+        warning_counts: dict[str, int] | None = None,
     ) -> bool:
         """Records a run that produced reports. `error_code` is set when
         the file still failed validation (no valid rows, or too many
@@ -331,6 +332,9 @@ class JobStore:
         if content_sha256 is not None:
             update_expression += ", content_sha256 = :content_sha256"
             values[":content_sha256"] = content_sha256
+        if warning_counts:
+            update_expression += ", warning_counts = :warning_counts"
+            values[":warning_counts"] = warning_counts
         if error_code is None:
             update_expression += " REMOVE error_code, error_message"
         else:

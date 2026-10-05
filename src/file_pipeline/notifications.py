@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
+_WARNING_LABELS = {"duplicate_rows": "repeated row", "outliers": "unusual value"}
+
 
 def build_notification_message(
     *,
@@ -32,6 +34,7 @@ def build_notification_message(
     error_code: str | None,
     error_message: str | None,
     duplicate_of: str | None = None,
+    warning_counts: dict[str, int] | None = None,
 ) -> tuple[str, str]:
     """Returns (subject, body). Reports are private S3 objects (no public
     access) -- the notification names their bucket/key so an authorized
@@ -44,6 +47,14 @@ def build_notification_message(
     if valid_row_count is not None and rejected_row_count is not None:
         lines.append(f"Valid rows: {valid_row_count}")
         lines.append(f"Rejected rows: {rejected_row_count}")
+
+    flagged = {name: int(count) for name, count in (warning_counts or {}).items() if count}
+    if flagged:
+        parts = [
+            f"{count} {_WARNING_LABELS.get(name, name)}{'' if count == 1 else 's'}"
+            for name, count in flagged.items()
+        ]
+        lines.append(f"Warnings: {', '.join(parts)} (row numbers are in summary.json)")
 
     if output_summary_key and output_rejected_key and output_bucket:
         lines.append(f"Summary report: s3://{output_bucket}/{output_summary_key}")

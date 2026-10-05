@@ -15,5 +15,16 @@
   },
   "rejected_row_count": 8,
   "total_revenue": "213.39",
-  "valid_row_count": 9
+  "valid_row_count": 9,
+  "warnings": {
+    "duplicate_rows": {
+      "count": 0,
+      "row_numbers": []
+    },
+    "outliers": {
+      "column": "unit_price",
+      "count": 0,
+      "row_numbers": []
+    }
+  }
 }

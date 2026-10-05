@@ -15,5 +15,9 @@
   },
   "delimiters": [",", ";", "\t"],
   "max_rejection_rate": 0.5,
+  "warnings": {
+    "duplicate_rows": true,
+    "outliers": { "column": "unit_price", "per": "product", "factor": 10 }
+  },
   "curated": { "partition_by_month": "date" }
 }

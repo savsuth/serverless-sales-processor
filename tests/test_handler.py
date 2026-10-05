@@ -782,3 +782,18 @@ def test_gzip_upload_is_processed_and_counts_as_the_same_content(aws_stack):
     gz_job = get_job(aws_stack, gz_id)
     assert gz_job["status"] == "duplicate_content"
     assert gz_job["duplicate_of"] == plain_id
+
+
+def test_warning_counts_reach_the_job_record_and_the_notification(aws_stack):
+    body = b"date,product,quantity,unit_price\n2024-01-01,Widget,1,9.99\n2024-01-01,Widget,1,9.99\n"
+    notifier = FakeNotifier()
+    _, job_id = _upload_and_process(aws_stack, "repeats.csv", body, notifier=notifier)
+
+    job = get_job(aws_stack, job_id)
+    assert job["status"] == "completed"
+    assert {k: int(v) for k, v in job["warning_counts"].items()} == {
+        "duplicate_rows": 1,
+        "outliers": 0,
+    }
+    ((_, _, message),) = notifier.calls
+    assert "Warnings: 1 repeated row (row numbers are in summary.json)" in message

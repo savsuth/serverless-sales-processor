@@ -55,13 +55,14 @@ import hashlib
 import io
 import itertools
 import re
+import statistics
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import IO, Any, TextIO
 
-from file_pipeline.schema import Column, Schema, load_schema
+from file_pipeline.schema import Column, OutlierRule, Schema, load_schema
 
 MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB
 
@@ -84,6 +85,9 @@ _NON_FINITE_TOKENS = {
 _FORMULA_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 REJECTED_CSV_EXTRA_COLUMNS = ("row_number", "rejection_reason")
+
+# A warning lists at most this many row numbers; its count is always exact.
+MAX_WARNING_ROW_NUMBERS = 20
 
 STATUS_COMPLETED = "completed"
 STATUS_COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
@@ -132,7 +136,10 @@ class ProcessingResult:
     both are None otherwise.
 
     `content_sha256` is the SHA-256 of the file's exact bytes, used to
-    recognize the same content uploaded again (see jobs.claim_content)."""
+    recognize the same content uploaded again (see jobs.claim_content).
+
+    `warnings` holds the schema's warning checks that ran, e.g.
+    {"duplicate_rows": {"count": 1, "row_numbers": [7]}}."""
 
     status: str
     valid_row_count: int
@@ -143,6 +150,7 @@ class ProcessingResult:
     error_code: str | None = None
     error_message: str | None = None
     content_sha256: str = ""
+    warnings: dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str) -> Any:
         schema = self.__dict__.get("schema")
@@ -318,6 +326,69 @@ def _validate_row(
     return values, None
 
 
+def _comparable(value: Any, ignore_case: bool) -> Any:
+    if isinstance(value, Decimal):
+        return value.normalize()  # 9.99 and 9.990 are the same price
+    if ignore_case:
+        return value.lower()
+    return value
+
+
+class _DuplicateRows:
+    """Spots valid rows whose values all equal an earlier valid row's.
+    Keeps a 16-byte digest per distinct row, not the row itself."""
+
+    def __init__(self, schema: Schema) -> None:
+        self._columns = [(c.name, c.case_insensitive) for c in schema.columns]
+        self._seen: set[bytes] = set()
+        self.row_numbers: list[int] = []
+
+    def add(self, row_number: int, values: dict[str, Any]) -> None:
+        key = tuple(_comparable(values[name], ignore_case) for name, ignore_case in self._columns)
+        digest = hashlib.blake2b(repr(key).encode(), digest_size=16).digest()
+        if digest in self._seen:
+            self.row_numbers.append(row_number)
+        else:
+            self._seen.add(digest)
+
+
+class _Outliers:
+    """Collects one numeric column per group, then flags values more than
+    `factor` times away from their group's median."""
+
+    def __init__(self, rule: OutlierRule, schema: Schema) -> None:
+        self._rule = rule
+        self._ignore_case = schema.column(rule.per).case_insensitive
+        self._groups: dict[Any, list[tuple[Decimal, int]]] = {}
+
+    def add(self, row_number: int, values: dict[str, Any]) -> None:
+        key = _comparable(values[self._rule.per], self._ignore_case)
+        value = Decimal(values[self._rule.column])
+        self._groups.setdefault(key, []).append((value, row_number))
+
+    def row_numbers(self) -> list[int]:
+        factor = self._rule.factor
+        flagged = []
+        for entries in self._groups.values():
+            if len(entries) < 3:
+                continue
+            median = statistics.median(value for value, _ in entries)
+            if median <= 0:
+                continue
+            flagged += [
+                n for value, n in entries if value > median * factor or value * factor < median
+            ]
+        return sorted(flagged)
+
+
+def _warning(row_numbers: list[int], **extra: Any) -> dict[str, Any]:
+    return {
+        **extra,
+        "count": len(row_numbers),
+        "row_numbers": row_numbers[:MAX_WARNING_ROW_NUMBERS],
+    }
+
+
 def process_csv(
     binary_stream: IO[bytes],
     rejected_csv_writer_target: TextIO,
@@ -369,6 +440,8 @@ def process_csv(
         group_case_insensitive = schema.column(schema.group_by).case_insensitive
         groups_by_key: dict[str, GroupTotals] = {}
         group_names: dict[str, str] = {}
+        duplicate_rows = _DuplicateRows(schema) if schema.warn_duplicate_rows else None
+        outliers = _Outliers(schema.outliers, schema) if schema.outliers else None
 
         row_number = 0
         for row in reader:
@@ -402,6 +475,10 @@ def process_csv(
 
             if on_valid_row is not None:
                 on_valid_row(row_number, values, row_measures)
+            if duplicate_rows is not None:
+                duplicate_rows.add(row_number, values)
+            if outliers is not None:
+                outliers.add(row_number, values)
 
             existing = groups_by_key.get(group_key)
             if existing is None:
@@ -417,6 +494,13 @@ def process_csv(
         raise MalformedCSVError(
             "invalid_gzip", "File starts like gzip but could not be decompressed"
         ) from exc
+
+    warnings: dict[str, Any] = {}
+    if duplicate_rows is not None:
+        warnings["duplicate_rows"] = _warning(duplicate_rows.row_numbers)
+    if outliers is not None:
+        assert schema.outliers is not None
+        warnings["outliers"] = _warning(outliers.row_numbers(), column=schema.outliers.column)
 
     error_code = error_message = None
     row_count = valid_row_count + rejected_row_count
@@ -447,6 +531,7 @@ def process_csv(
         error_code=error_code,
         error_message=error_message,
         content_sha256=raw.sha256.hexdigest(),
+        warnings=warnings,
     )
 
 
@@ -471,6 +556,8 @@ def build_summary_dict(result: ProcessingResult) -> dict:
     }
     for name, amount in result.totals.items():
         summary[f"total_{name}"] = _serialize_amount(amount)
+    if result.warnings:
+        summary["warnings"] = result.warnings
     return summary
 
 
