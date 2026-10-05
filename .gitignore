@@ -43,3 +43,6 @@ infra/**/backend.hcl
 infra/**/*.tfvars
 infra/**/*.tfvars.json
 !infra/**/*.tfvars.example
+
+# Hypothesis example database
+.hypothesis/
