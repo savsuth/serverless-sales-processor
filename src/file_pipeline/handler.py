@@ -122,15 +122,19 @@ def _default_dependencies() -> Dependencies:
     table = dynamodb.Table(os.environ["JOB_TABLE_NAME"])
     lease_seconds = int(os.environ.get("LEASE_SECONDS", jobs.DEFAULT_LEASE_SECONDS))
 
+    schema = load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA))
+
     return Dependencies(
-        job_store=jobs.JobStore(table, lease_seconds=lease_seconds),
+        job_store=jobs.JobStore(
+            table, lease_seconds=lease_seconds, rules=(schema.name, schema.version)
+        ),
         object_storage=storage.S3Storage(boto3.client("s3")),
         notifier=notifications.SNSNotifier(
             boto3.client("sns"), os.environ["NOTIFICATION_TOPIC_ARN"]
         ),
         output_bucket=os.environ["OUTPUT_BUCKET_NAME"],
         max_input_bytes=int(os.environ.get("MAX_INPUT_BYTES", MAX_INPUT_BYTES)),
-        schema=load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA)),
+        schema=schema,
         max_receive_count=int(os.environ.get("MAX_RECEIVE_COUNT", 5)),
     )
 
@@ -383,6 +387,16 @@ def _run_processing(
                 summary_bytes,
                 rejected_bytes,
                 curated.files() if curated and completed else (),
+                manifest={
+                    "job_id": job_id,
+                    "status": result.status,
+                    "error_code": result.error_code,
+                    "schema": deps.schema.name,
+                    "schema_version": deps.schema.version,
+                    "content_sha256": result.content_sha256,
+                    "valid_row_count": result.valid_row_count,
+                    "rejected_row_count": result.rejected_row_count,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - temporary AWS error
             return _fail(

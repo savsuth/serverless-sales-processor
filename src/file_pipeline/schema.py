@@ -54,6 +54,11 @@ rejected rows is strictly above it, even though some rows were valid:
 its reports are still written, but its status is `validation_failed`.
 Omit it to accept any share of rejected rows.
 
+`version` (optional, default 1) numbers the rules. Bump it when a rule
+changes; each job records the schema name and version it was processed
+with, and `scripts/reprocess.py --older-than-version N` re-runs jobs
+processed under older rules.
+
 `delimiters` (optional, default `[","]`) lists the field separators a
 file may use, in order of preference; the first one that splits the
 header into all the required columns is used, so semicolon- or
@@ -149,6 +154,7 @@ class Schema:
     group_by: str
     measures: tuple[Measure, ...]
     max_rejection_rate: Decimal | None = None
+    version: int = 1
     curated_partition_column: str | None = None
     delimiters: tuple[str, ...] = (",",)
     warn_duplicate_rows: bool = False
@@ -184,7 +190,7 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         data,
         "schema",
         required={"name", "columns", "aggregation"},
-        optional={"max_rejection_rate", "curated", "delimiters", "warnings"},
+        optional={"max_rejection_rate", "curated", "delimiters", "warnings", "version"},
     )
     name = data["name"]
     if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
@@ -223,6 +229,7 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         group_by=group_by,
         measures=measures,
         max_rejection_rate=_parse_rate(data.get("max_rejection_rate")),
+        version=_parse_version(data.get("version", 1)),
         curated_partition_column=_parse_curated(data.get("curated"), by_name, measures),
         delimiters=_parse_delimiters(data.get("delimiters", [","])),
         **_parse_warnings(data.get("warnings"), by_name),
@@ -254,6 +261,12 @@ def _parse_warnings(value: Any, columns: dict[str, Column]) -> dict[str, Any]:
             raise SchemaError(f"warnings.outliers factor must be a number above 1: {factor!r}")
         outliers = OutlierRule(column=column.name, per=per.name, factor=Decimal(str(factor)))
     return {"warn_duplicate_rows": duplicate_rows, "outliers": outliers}
+
+
+def _parse_version(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SchemaError(f"version must be a whole number from 1 up: {value!r}")
+    return value
 
 
 def _parse_delimiters(value: Any) -> tuple[str, ...]:

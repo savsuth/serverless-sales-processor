@@ -288,3 +288,14 @@ def test_bundled_sales_schema_warns_about_repeats_and_price_outliers():
 def test_invalid_warnings_are_rejected(warnings):
     with pytest.raises(SchemaError):
         parse_schema({**INVENTORY_SCHEMA, "warnings": warnings})
+
+
+def test_schema_version_defaults_to_one():
+    assert parse_schema(INVENTORY_SCHEMA).version == 1
+    assert load_schema().version == 1
+
+
+@pytest.mark.parametrize("version", [0, -1, 1.5, "2", True])
+def test_invalid_schema_versions_are_rejected(version):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "version": version})

@@ -153,9 +153,17 @@ def _is_conditional_check_failed(exc: ClientError) -> bool:
 
 
 class JobStore:
-    def __init__(self, table: Any, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> None:
+    def __init__(
+        self,
+        table: Any,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        rules: tuple[str, int] | None = None,
+    ) -> None:
+        """`rules` (schema name, version) is recorded on every claim, so a
+        job shows which rules its latest attempt ran with."""
         self._table = table
         self._lease_seconds = lease_seconds
+        self._rules = rules
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         response = self._table.get_item(Key={"job_id": job_id}, ConsistentRead=True)
@@ -184,6 +192,7 @@ class JobStore:
                     "created_at": _now_iso(),
                     "updated_at": _now_iso(),
                     "notification_status": NOTIFICATION_PENDING,
+                    **self._rules_fields(),
                 },
                 ConditionExpression=Attr("job_id").not_exists(),
             )
@@ -221,6 +230,7 @@ class JobStore:
                     "attempt_count = attempt_count + :one, "
                     "updated_at = :updated_at, "
                     "notification_status = :notif_pending"
+                    + "".join(f", {name} = :{name}" for name in self._rules_fields())
                 ),
                 ConditionExpression=condition,
                 ExpressionAttributeNames={"#status": "status"},
@@ -231,6 +241,7 @@ class JobStore:
                     ":one": 1,
                     ":updated_at": _now_iso(),
                     ":notif_pending": NOTIFICATION_PENDING,
+                    **{f":{name}": value for name, value in self._rules_fields().items()},
                 },
             )
             return ClaimResult(status=ClaimStatus.OWNED, lease_token=token)
@@ -301,6 +312,11 @@ class JobStore:
             if _is_conditional_check_failed(exc):
                 return False
             raise
+
+    def _rules_fields(self) -> dict[str, Any]:
+        if self._rules is None:
+            return {}
+        return {"schema_name": self._rules[0], "schema_version": self._rules[1]}
 
     def finalize_success(
         self,

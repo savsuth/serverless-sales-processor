@@ -8,6 +8,8 @@ than accumulating duplicates.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import IO, Any
@@ -19,6 +21,7 @@ INPUT_SUFFIXES = (".csv", ".csv.gz")
 
 SUMMARY_KEY_TEMPLATE = "reports/{job_id}/summary.json"
 REJECTED_KEY_TEMPLATE = "reports/{job_id}/rejected_rows.csv"
+MANIFEST_KEY_TEMPLATE = "reports/{job_id}/manifest.json"
 
 
 def is_input_key(key: str) -> bool:
@@ -31,6 +34,14 @@ def summary_key(job_id: str) -> str:
 
 def rejected_key(job_id: str) -> str:
     return REJECTED_KEY_TEMPLATE.format(job_id=job_id)
+
+
+def manifest_key(job_id: str) -> str:
+    return MANIFEST_KEY_TEMPLATE.format(job_id=job_id)
+
+
+def _file_entry(key: str, body: bytes) -> dict[str, Any]:
+    return {"key": key, "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()}
 
 
 @dataclass
@@ -68,13 +79,20 @@ class S3Storage:
         summary_bytes: bytes,
         rejected_csv_bytes: bytes,
         curated_files: Iterable[tuple[str, bytes]] = (),
+        manifest: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         """Writes both report objects at their deterministic keys, then
-        any curated files (key, gzip bytes; see curated.py). Safe to
-        call repeatedly on retry: each call fully overwrites every key, so
-        a partial prior attempt (e.g. only summary.json written before a
+        any curated files (key, gzip bytes; see curated.py), then -- if
+        `manifest` is given -- manifest.json, last. Safe to call
+        repeatedly on retry: each call fully overwrites every key, so a
+        partial prior attempt (e.g. only summary.json written before a
         crash) is corrected by the next successful attempt writing all of
-        them again."""
+        them again.
+
+        manifest.json is the completion marker: it exists only once every
+        other object of the job is written, and lists each with its
+        SHA-256 and size alongside the `manifest` fields, so a reader can
+        verify it has a complete, untorn set."""
         summary_object_key = summary_key(job_id)
         rejected_object_key = rejected_key(job_id)
 
@@ -90,8 +108,26 @@ class S3Storage:
             Body=rejected_csv_bytes,
             ContentType="text/csv",
         )
+        curated_entries = []
         for key, body in curated_files:
             self._s3.put_object(
                 Bucket=output_bucket, Key=key, Body=body, ContentType="application/gzip"
+            )
+            curated_entries.append(_file_entry(key, body))
+
+        if manifest is not None:
+            document = {
+                **manifest,
+                "files": [
+                    _file_entry(summary_object_key, summary_bytes),
+                    _file_entry(rejected_object_key, rejected_csv_bytes),
+                ],
+                "curated_files": curated_entries,
+            }
+            self._s3.put_object(
+                Bucket=output_bucket,
+                Key=manifest_key(job_id),
+                Body=(json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+                ContentType="application/json",
             )
         return summary_object_key, rejected_object_key

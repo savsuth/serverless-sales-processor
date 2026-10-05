@@ -904,3 +904,73 @@ def test_waiting_duplicate_is_dead_lettered_on_its_last_delivery(aws_stack):
     assert result == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
     job = get_job(aws_stack, jobs.compute_job_id(INPUT_BUCKET, "b.csv", v2))
     assert (job["status"], job["error_code"]) == ("dead_lettered", "waiting_for_original_job")
+
+
+# --- manifest.json: the completion marker ---
+
+
+class RecordingS3Client:
+    def __init__(self, real_client):
+        self._real = real_client
+        self.put_keys: list[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def put_object(self, **kwargs):
+        self.put_keys.append(kwargs["Key"])
+        return self._real.put_object(**kwargs)
+
+
+def test_manifest_is_written_last_and_matches_every_output(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", MIXED_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    recorder = RecordingS3Client(aws_stack["s3"])
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+
+    handler.handle_event(
+        event, make_deps(aws_stack, object_storage=storage.S3Storage(recorder))
+    )
+
+    assert recorder.put_keys[-1] == f"reports/{job_id}/manifest.json"
+    manifest = json.loads(
+        aws_stack["s3"]
+        .get_object(Bucket=OUTPUT_BUCKET, Key=f"reports/{job_id}/manifest.json")["Body"]
+        .read()
+    )
+    assert manifest["job_id"] == job_id
+    assert manifest["status"] == "completed_with_rejections"
+    assert (manifest["schema"], manifest["schema_version"]) == ("sales", 1)
+    assert manifest["content_sha256"] == hashlib.sha256(MIXED_CSV).hexdigest()
+    listed = manifest["files"] + manifest["curated_files"]
+    assert [entry["key"] for entry in listed] == recorder.put_keys[:-1]
+    for entry in listed:
+        body = aws_stack["s3"].get_object(Bucket=OUTPUT_BUCKET, Key=entry["key"])["Body"].read()
+        assert entry == {
+            "key": entry["key"],
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+
+def test_failed_validation_manifest_lists_no_curated_files(aws_stack):
+    _, job_id = _upload_and_process(aws_stack, "bad.csv", ALL_INVALID_CSV)
+    manifest = json.loads(
+        aws_stack["s3"]
+        .get_object(Bucket=OUTPUT_BUCKET, Key=f"reports/{job_id}/manifest.json")["Body"]
+        .read()
+    )
+    assert (manifest["status"], manifest["error_code"]) == ("validation_failed", "no_valid_rows")
+    assert manifest["curated_files"] == []
+
+
+def test_claims_record_the_rules_version_they_ran_with(aws_stack):
+    store = jobs.JobStore(aws_stack["table"], rules=("sales", 3))
+    store.claim("job-1", INPUT_BUCKET, "a.csv", "v1")
+    job = get_job(aws_stack, "job-1")
+    assert (job["schema_name"], int(job["schema_version"])) == ("sales", 3)
+
+    store.mark_failed("job-1", job["lease_owner"], error_code="x", error_message="y")
+    newer = jobs.JobStore(aws_stack["table"], rules=("sales", 4))
+    assert newer.claim("job-1", INPUT_BUCKET, "a.csv", "v1").status is jobs.ClaimStatus.OWNED
+    assert int(get_job(aws_stack, "job-1")["schema_version"]) == 4
