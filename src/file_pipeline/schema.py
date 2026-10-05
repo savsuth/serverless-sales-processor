@@ -48,11 +48,22 @@ column; `total: true` also reports a grand total as `total_<name>`.
 rejected rows is strictly above it, even though some rows were valid:
 its reports are still written, but its status is `validation_failed`.
 Omit it to accept any share of rejected rows.
+
+`curated` (optional) makes the Lambda also write every valid row of a
+completed job as queryable data for Athena, one file per calendar month
+of the named date column (see curated.py):
+
+    "curated": {"partition_by_month": "date"}
+
+Column and measure names then become Athena column names, so they must
+be plain identifiers (lowercase letters, digits, underscores), and
+`month`, `job_id`, and `source_row_number` are reserved.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import cache
@@ -70,6 +81,10 @@ COLUMN_OPTIONS = {
 }
 GROUPABLE_TYPES = frozenset({"date", "string"})
 NUMERIC_TYPES = frozenset({"integer", "decimal"})
+
+# Added to every curated row (curated.py), plus the `month` partition.
+CURATED_RESERVED_NAMES = frozenset({"month", "job_id", "source_row_number"})
+_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 class SchemaError(Exception):
@@ -101,6 +116,7 @@ class Schema:
     group_by: str
     measures: tuple[Measure, ...]
     max_rejection_rate: Decimal | None = None
+    curated_partition_column: str | None = None
 
     @property
     def column_names(self) -> tuple[str, ...]:
@@ -126,11 +142,15 @@ def _load_bundled(name: str) -> Schema:
 
 def parse_schema(data: dict[str, Any]) -> Schema:
     _require_keys(
-        data, "schema", required={"name", "columns", "aggregation"}, optional={"max_rejection_rate"}
+        data,
+        "schema",
+        required={"name", "columns", "aggregation"},
+        optional={"max_rejection_rate", "curated"},
     )
     name = data["name"]
-    if not isinstance(name, str) or not name:
-        raise SchemaError("schema name must be a non-empty string")
+    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
+        # Also the curated S3 prefix and Athena table name.
+        raise SchemaError(f"schema name must be lowercase letters, digits, underscores: {name!r}")
 
     columns = tuple(_parse_column(c) for c in _non_empty_list(data["columns"], "columns"))
     by_name = {c.name: c for c in columns}
@@ -151,6 +171,12 @@ def parse_schema(data: dict[str, Any]) -> Schema:
     )
     if len({m.name for m in measures}) != len(measures):
         raise SchemaError("measure names must be unique")
+    for measure in measures:
+        # A measure may share a column's name only when it is exactly
+        # that column (e.g. "quantity" summing the quantity column), so
+        # a name always means one thing in reports and curated data.
+        if measure.name in by_name and measure.multiply != (measure.name,):
+            raise SchemaError(f"measure {measure.name!r} clashes with the column of that name")
 
     return Schema(
         name=name,
@@ -158,7 +184,29 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         group_by=group_by,
         measures=measures,
         max_rejection_rate=_parse_rate(data.get("max_rejection_rate")),
+        curated_partition_column=_parse_curated(data.get("curated"), by_name, measures),
     )
+
+
+def _parse_curated(
+    value: Any, columns: dict[str, Column], measures: tuple[Measure, ...]
+) -> str | None:
+    if value is None:
+        return None
+    _require_keys(value, "curated", required={"partition_by_month"})
+    partition_column = value["partition_by_month"]
+    column = columns.get(partition_column)
+    if column is None or column.type != "date":
+        raise SchemaError(
+            f"curated partition_by_month must name a date column: {partition_column!r}"
+        )
+
+    for name in [*columns, *(m.name for m in measures)]:
+        if not _IDENTIFIER_RE.match(name):
+            raise SchemaError(f"with curated output, {name!r} must be a plain identifier")
+        if name in CURATED_RESERVED_NAMES:
+            raise SchemaError(f"with curated output, {name!r} is a reserved name")
+    return partition_column
 
 
 def _parse_rate(value: Any) -> Decimal | None:

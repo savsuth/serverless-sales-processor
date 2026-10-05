@@ -13,5 +13,6 @@
       { "name": "revenue", "multiply": ["quantity", "unit_price"], "total": true }
     ]
   },
-  "max_rejection_rate": 0.5
+  "max_rejection_rate": 0.5,
+  "curated": { "partition_by_month": "date" }
 }

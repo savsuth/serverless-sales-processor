@@ -10,6 +10,8 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   region     = var.aws_region
   prefix     = var.project_name
+  # Glue database names cannot contain hyphens; matches infra/athena.tf.
+  glue_database = replace(var.project_name, "-", "_")
 
   create_oidc_provider = var.enable_github_oidc && var.existing_github_oidc_provider_arn == ""
   oidc_provider_arn = var.existing_github_oidc_provider_arn != "" ? var.existing_github_oidc_provider_arn : (
@@ -125,7 +127,31 @@ data "aws_iam_policy_document" "github_actions_deploy" {
       "arn:aws:s3:::${local.prefix}-input-*/*",
       "arn:aws:s3:::${local.prefix}-output-*",
       "arn:aws:s3:::${local.prefix}-output-*/*",
+      "arn:aws:s3:::${local.prefix}-athena-results-*",
+      "arn:aws:s3:::${local.prefix}-athena-results-*/*",
     ]
+  }
+
+  # The Glue database and table behind Athena. The catalog ARN is required
+  # alongside the database for any database-level call.
+  statement {
+    sid     = "ManageGlueCatalog"
+    effect  = "Allow"
+    actions = ["glue:*"]
+    resources = [
+      "arn:aws:glue:${local.region}:${local.account_id}:catalog",
+      "arn:aws:glue:${local.region}:${local.account_id}:database/${local.glue_database}",
+      "arn:aws:glue:${local.region}:${local.account_id}:table/${local.glue_database}/*",
+    ]
+  }
+
+  # The Athena workgroup and its saved queries (named queries are
+  # authorized against the workgroup ARN).
+  statement {
+    sid       = "ManageAthenaWorkgroup"
+    effect    = "Allow"
+    actions   = ["athena:*"]
+    resources = ["arn:aws:athena:${local.region}:${local.account_id}:workgroup/${local.prefix}-*"]
   }
 
   statement {

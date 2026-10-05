@@ -46,6 +46,7 @@ import datetime
 import hashlib
 import io
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import IO, Any, TextIO
@@ -275,8 +276,13 @@ def process_csv(
     *,
     max_bytes: int = MAX_INPUT_BYTES,
     schema: Schema | None = None,
+    on_valid_row: Callable[[int, dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> ProcessingResult:
     """Streams and validates a CSV file, writing rejected rows as it goes.
+
+    `on_valid_row(row_number, values, measures)`, if given, is called for
+    every valid row with its parsed column values and computed measures
+    (used to build curated output; see curated.py).
 
     `rejected_csv_writer_target` should be a caller-owned, writable text
     stream (e.g. a SpooledTemporaryFile) that the caller only persists to
@@ -335,6 +341,8 @@ def process_csv(
                 row_measures[measure.name] = amount
                 if measure.total:
                     totals[measure.name] += amount
+            if on_valid_row is not None:
+                on_valid_row(row_number, values, row_measures)
 
             group_key = values[schema.group_by]
             existing = groups.get(group_key)

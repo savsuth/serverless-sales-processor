@@ -176,3 +176,65 @@ def test_bundled_sales_schema_allows_at_most_half_the_rows_rejected():
 def test_invalid_max_rejection_rate_is_rejected(rate):
     with pytest.raises(SchemaError):
         parse_schema({**INVENTORY_SCHEMA, "max_rejection_rate": rate})
+
+
+def test_bundled_sales_schema_writes_curated_data_by_month_of_date():
+    assert load_schema().curated_partition_column == "date"
+
+
+def _with_curated(change=None):
+    schema = copy.deepcopy(INVENTORY_SCHEMA)
+    schema["curated"] = {"partition_by_month": "counted_on"}
+    if change:
+        change(schema)
+    return schema
+
+
+def test_inventory_schema_with_curated_output_is_valid():
+    assert parse_schema(_with_curated()).curated_partition_column == "counted_on"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        _with_curated(lambda s: s["curated"].update(partition_by_month="sku")),
+        _with_curated(lambda s: s["curated"].update(partition_by_month="missing")),
+        _with_curated(lambda s: s["curated"].update(extra=True)),
+        _with_curated(lambda s: s["columns"][1].update(name="stock keeping unit")),
+        _with_curated(lambda s: s["columns"][1].update(name="job_id")),
+        _with_curated(lambda s: s["columns"].append({"name": "month", "type": "string"})),
+        _with_curated(lambda s: s["aggregation"]["measures"][1].update(name="source_row_number")),
+    ],
+    ids=[
+        "partition_column_not_a_date",
+        "partition_column_unknown",
+        "unknown_curated_key",
+        "column_name_not_an_identifier",
+        "column_uses_reserved_name",
+        "column_named_month",
+        "measure_uses_reserved_name",
+    ],
+)
+def test_invalid_curated_settings_are_rejected(schema):
+    with pytest.raises(SchemaError):
+        parse_schema(schema)
+
+
+def test_non_identifier_column_names_are_fine_without_curated_output():
+    schema = copy.deepcopy(INVENTORY_SCHEMA)
+    schema["columns"][1]["name"] = "stock keeping unit"
+    schema["aggregation"]["group_by"] = "counted_on"
+    assert parse_schema(schema).column_names[1] == "stock keeping unit"
+
+
+def test_measure_cannot_reuse_a_column_name_for_a_different_calculation():
+    schema = copy.deepcopy(INVENTORY_SCHEMA)
+    schema["aggregation"]["measures"][1]["name"] = "unit_cost"
+    with pytest.raises(SchemaError):
+        parse_schema(schema)
+
+
+@pytest.mark.parametrize("name", ["Sales", "sales-2024", "", "2024sales"])
+def test_schema_name_must_be_a_plain_identifier(name):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "name": name})

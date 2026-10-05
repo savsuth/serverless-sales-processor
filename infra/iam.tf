@@ -30,10 +30,13 @@ data "aws_iam_policy_document" "lambda_permissions" {
   }
 
   statement {
-    sid       = "WriteOutputReports"
-    effect    = "Allow"
-    actions   = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.output.arn}/reports/*"]
+    sid     = "WriteOutputReports"
+    effect  = "Allow"
+    actions = ["s3:PutObject"]
+    resources = [
+      "${aws_s3_bucket.output.arn}/reports/*",
+      "${aws_s3_bucket.output.arn}/curated/*",
+    ]
   }
 
   statement {

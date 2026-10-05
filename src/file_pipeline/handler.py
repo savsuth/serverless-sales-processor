@@ -30,6 +30,7 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from file_pipeline import jobs, notifications, storage
+from file_pipeline.curated import CuratedWriter
 from file_pipeline.processor import (
     MAX_INPUT_BYTES,
     InputTooLargeError,
@@ -251,15 +252,24 @@ def _run_processing(
     except Exception as exc:  # noqa: BLE001
         return _fail(job_id, token, deps, error_code="s3_get_object_error", exc=exc)
 
+    # Collects valid rows for Athena while the file streams; they are
+    # only uploaded below if the job completes with new content.
+    curated = CuratedWriter(deps.schema, job_id) if deps.schema.curated_partition_column else None
+
     with (
         contextlib.closing(handle.body),
         tempfile.SpooledTemporaryFile(
             max_size=REJECTED_BUFFER_SPOOL_BYTES, mode="w+", encoding="utf-8", newline=""
         ) as rejected_buffer,
+        curated or contextlib.nullcontext(),
     ):
         try:
             result = process_csv(
-                handle.body, rejected_buffer, max_bytes=deps.max_input_bytes, schema=deps.schema
+                handle.body,
+                rejected_buffer,
+                max_bytes=deps.max_input_bytes,
+                schema=deps.schema,
+                on_valid_row=curated.add if curated else None,
             )
         except MalformedCSVError as exc:
             return _finish_validation_failed(
@@ -296,12 +306,19 @@ def _run_processing(
                     job_id, token, deps, original_job_id=content.first_job_id
                 )
 
+        # Reaching here with a completed status means this job owns the
+        # content (duplicates returned above), so its rows are new data.
+        completed = result.status in jobs.COMPLETED_STATUSES
         try:
             summary_bytes = summary_json_bytes(result)
             rejected_buffer.seek(0)
             rejected_bytes = rejected_buffer.read().encode("utf-8")
             summary_key, rejected_key = deps.object_storage.put_report(
-                deps.output_bucket, job_id, summary_bytes, rejected_bytes
+                deps.output_bucket,
+                job_id,
+                summary_bytes,
+                rejected_bytes,
+                curated.files() if curated and completed else (),
             )
         except Exception as exc:  # noqa: BLE001 - temporary AWS error
             return _fail(

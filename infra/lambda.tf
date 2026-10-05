@@ -45,13 +45,6 @@ resource "aws_lambda_function" "processor" {
     }
   }
 
-  lifecycle {
-    precondition {
-      condition     = fileexists("${path.module}/../src/file_pipeline/schemas/${var.schema_name}.json")
-      error_message = "schema_name must name a file in src/file_pipeline/schemas/ (without .json)."
-    }
-  }
-
   depends_on = [
     aws_cloudwatch_log_group.lambda,
     aws_iam_role_policy.lambda_exec,

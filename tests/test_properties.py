@@ -24,8 +24,10 @@ from hypothesis import strategies as st
 from moto import mock_aws
 
 from file_pipeline import handler, jobs, notifications, storage
+from file_pipeline.curated import CuratedWriter, read_curated_file
 from file_pipeline.local import main
 from file_pipeline.processor import build_summary_dict, process_csv, summary_json_bytes
+from file_pipeline.schema import load_schema
 
 HEADER = ["date", "product", "quantity", "unit_price"]
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
@@ -285,3 +287,20 @@ def _run_lambda(csv_bytes: bytes) -> dict[str, bytes]:
             ].read()
             for name in _REPORTS
         }
+
+
+@settings(max_examples=200, deadline=None)
+@given(sales_files)
+def test_curated_rows_add_up_to_the_summary(rows):
+    """What Athena adds up over the curated data must equal the report."""
+    with CuratedWriter(load_schema(), "job") as writer:
+        result = process_csv(
+            io.BytesIO(_to_csv_bytes(rows)), io.StringIO(), on_valid_row=writer.add
+        )
+        files = list(writer.files())
+
+    curated_rows = [(key, row) for key, body in files for row in read_curated_file(body)]
+    assert len(curated_rows) == result.valid_row_count
+    assert sum((row["revenue"] for _, row in curated_rows), Decimal("0")) == result.total_revenue
+    for key, row in curated_rows:
+        assert f"/month={row['date'][:7]}/" in key

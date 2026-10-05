@@ -17,9 +17,40 @@ variable "max_input_bytes" {
 }
 
 variable "schema_name" {
-  description = "Which bundled schema (src/file_pipeline/schemas/<name>.json) the Lambda validates and aggregates uploads with. One schema per deployment."
+  description = "Which bundled schema (src/file_pipeline/schemas/<name>.json) the Lambda validates and aggregates uploads with. One schema per deployment. Also names the Athena table."
   type        = string
   default     = "sales"
+}
+
+# --- Athena (queryable history) ---------------------------------------
+
+variable "enable_athena" {
+  description = "Create the Glue table, Athena workgroup, and query-results bucket for the curated data. Takes effect only when the schema has a \"curated\" section; the Lambda writes curated files either way."
+  type        = bool
+  default     = true
+}
+
+variable "athena_bytes_scanned_cutoff" {
+  description = "Athena cancels any single query in the project workgroup that would scan more than this many bytes (Athena bills per byte scanned). AWS minimum is 10 MB."
+  type        = number
+  default     = 1073741824 # 1 GiB
+
+  validation {
+    condition     = var.athena_bytes_scanned_cutoff >= 10485760
+    error_message = "athena_bytes_scanned_cutoff must be at least 10485760 (10 MB), the AWS minimum."
+  }
+}
+
+variable "athena_results_retention_days" {
+  description = "Days before Athena query-result files are deleted from the results bucket. They are copies of query output, not project data."
+  type        = number
+  default     = 7
+}
+
+variable "athena_month_range" {
+  description = "Months Athena's partition projection exposes, as \"FIRST,LAST\" in yyyy-MM (\"NOW\" = the current month). Curated rows dated outside the range are stored but not visible to queries."
+  type        = string
+  default     = "2000-01,NOW"
 }
 
 # --- Lambda sizing ---------------------------------------------------------

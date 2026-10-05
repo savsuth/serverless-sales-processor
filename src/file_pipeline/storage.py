@@ -8,6 +8,7 @@ than accumulating duplicates.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import IO, Any
 
@@ -57,12 +58,14 @@ class S3Storage:
         job_id: str,
         summary_bytes: bytes,
         rejected_csv_bytes: bytes,
+        curated_files: Iterable[tuple[str, bytes]] = (),
     ) -> tuple[str, str]:
-        """Writes both report objects at their deterministic keys. Safe to
-        call repeatedly on retry: each call fully overwrites both keys, so
+        """Writes both report objects at their deterministic keys, then
+        any curated files (key, gzip bytes; see curated.py). Safe to
+        call repeatedly on retry: each call fully overwrites every key, so
         a partial prior attempt (e.g. only summary.json written before a
-        crash) is corrected by the next successful attempt writing both
-        again."""
+        crash) is corrected by the next successful attempt writing all of
+        them again."""
         summary_object_key = summary_key(job_id)
         rejected_object_key = rejected_key(job_id)
 
@@ -78,4 +81,8 @@ class S3Storage:
             Body=rejected_csv_bytes,
             ContentType="text/csv",
         )
+        for key, body in curated_files:
+            self._s3.put_object(
+                Bucket=output_bucket, Key=key, Body=body, ContentType="application/gzip"
+            )
         return summary_object_key, rejected_object_key

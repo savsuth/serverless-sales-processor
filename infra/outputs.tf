@@ -41,3 +41,18 @@ output "lambda_function_name" {
 output "lambda_log_group_name" {
   value = aws_cloudwatch_log_group.lambda.name
 }
+
+output "athena_workgroup_name" {
+  description = "Run queries in this workgroup (Athena console: choose it at the top of the query editor). Example queries are saved in it."
+  value       = try(aws_athena_workgroup.analytics[0].name, null)
+}
+
+output "athena_database_name" {
+  description = "Glue database holding the curated table."
+  value       = try(aws_glue_catalog_database.analytics[0].name, null)
+}
+
+output "athena_table_name" {
+  description = "Curated table: one row per valid source CSV row of every completed job, partitioned by month."
+  value       = try(aws_glue_catalog_table.curated[0].name, null)
+}

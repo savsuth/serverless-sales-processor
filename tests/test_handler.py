@@ -4,12 +4,14 @@ in this file (moto intercepts every boto3 call)."""
 
 import hashlib
 import json
+from decimal import Decimal
 
 import boto3
 import pytest
 from moto import mock_aws
 
 from file_pipeline import handler, jobs, notifications, storage
+from file_pipeline.curated import read_curated_file
 
 TABLE_NAME = "test-jobs"
 INPUT_BUCKET = "test-input-bucket"
@@ -710,3 +712,32 @@ def test_duplicate_notification_is_retried_without_reprocessing(aws_stack):
     assert second == {"batchItemFailures": []}
     ((_, _, body),) = notifier.calls
     assert "Duplicate of job:" in body
+
+
+# --- Curated output for Athena ---
+
+
+def _curated_keys(aws_stack):
+    listing = aws_stack["s3"].list_objects_v2(Bucket=OUTPUT_BUCKET, Prefix="curated/")
+    return sorted(obj["Key"] for obj in listing.get("Contents", []))
+
+
+def test_completed_job_writes_its_valid_rows_for_athena(aws_stack):
+    _, job_id = _upload_and_process(aws_stack, "sales.csv", MIXED_CSV)
+
+    key = f"curated/sales/month=2024-01/{job_id}.json.gz"
+    assert _curated_keys(aws_stack) == [key]
+    body = aws_stack["s3"].get_object(Bucket=OUTPUT_BUCKET, Key=key)["Body"].read()
+    (row,) = read_curated_file(body)
+    assert row["revenue"] == Decimal("29.97")
+    assert row["job_id"] == job_id
+    assert row["source_row_number"] == 1
+
+
+def test_failed_and_duplicate_jobs_write_no_rows_for_athena(aws_stack):
+    _, first_id = _upload_and_process(aws_stack, "jan.csv", VALID_CSV)
+    _upload_and_process(aws_stack, "jan-copy.csv", VALID_CSV)  # duplicate_content
+    _upload_and_process(aws_stack, "mostly-bad.csv", HIGH_REJECTION_CSV)  # validation_failed
+    _upload_and_process(aws_stack, "all-bad.csv", ALL_INVALID_CSV)  # validation_failed
+
+    assert _curated_keys(aws_stack) == [f"curated/sales/month=2024-01/{first_id}.json.gz"]
