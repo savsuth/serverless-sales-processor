@@ -28,6 +28,7 @@ files.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -65,7 +66,9 @@ class PortalConfig:
     now: Callable[[], float] = field(default=time.time)
 
 
+@functools.cache
 def _default_config() -> PortalConfig:
+    """Built once per Lambda container and reused by warm requests."""
     import boto3
 
     return PortalConfig(

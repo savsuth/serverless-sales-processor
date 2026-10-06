@@ -18,6 +18,7 @@ docs/decisions/0002-sqs-between-s3-and-lambda.md for how to recover that).
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -155,7 +156,11 @@ class Dependencies:
     report_links: links.ReportLinks | None = None
 
 
+@functools.cache
 def _default_dependencies() -> Dependencies:
+    """Built once per Lambda container and reused by warm invocations,
+    so clients and their connections are not recreated for every file.
+    Nothing in it holds per-job state."""
     import boto3
 
     dynamodb = boto3.resource("dynamodb")

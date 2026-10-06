@@ -1110,3 +1110,21 @@ def test_event_publisher_sends_to_eventbridge(aws_stack):
     events_client = boto3.client("events", region_name=REGION)
     publisher = notifications.EventPublisher(events_client, "default", "csv-sales-pipeline")
     publisher.publish(detail_type="CSV job finished", detail={"job_id": "x", "status": "completed"})
+
+
+def test_lambda_builds_its_dependencies_once_per_container(aws_stack, monkeypatch):
+    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
+    monkeypatch.setenv("JOB_TABLE_NAME", TABLE_NAME)
+    monkeypatch.setenv("OUTPUT_BUCKET_NAME", OUTPUT_BUCKET)
+    monkeypatch.setenv("NOTIFICATION_TOPIC_ARN", aws_stack["topic_arn"])
+    handler._default_dependencies.cache_clear()
+    try:
+        version_id = upload(aws_stack["s3"], "uploads/a.csv", VALID_CSV)
+        event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "uploads/a.csv", version_id))]}
+        assert handler.lambda_handler(event, None) == {"batchItemFailures": []}
+        first = handler._default_dependencies()
+        assert handler.lambda_handler({"Records": []}, None) == {"batchItemFailures": []}
+        assert handler._default_dependencies() is first
+        assert handler._default_dependencies.cache_info().misses == 1
+    finally:
+        handler._default_dependencies.cache_clear()
