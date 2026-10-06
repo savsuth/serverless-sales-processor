@@ -82,9 +82,9 @@ take a different, shorter path:
 
 ![Job status lifecycle: a job is claimed into processing under a lease, then ends as completed, validation failed, or duplicate content; a retryable failure returns to processing on redelivery, while the fifth failed delivery or a code error dead-letters the job, which a redrive or the reprocess script sends back to processing.](docs/job-lifecycle.svg)
 
-See [Reliability and limitations](#reliability-and-limitations) and
-[decision record 0004](docs/decisions/0004-expiring-lease-claims.md) for
-how claims and leases work.
+How claims, leases and retries work is explained in
+[decision record 0004](docs/decisions/0004-expiring-lease-claims.md) and
+the other [design decision records](docs/decisions/).
 
 Uploads from the browser and the download links in emails go through a
 small portal API; files themselves move directly between the browser and
@@ -96,7 +96,8 @@ S3 on short-lived signed URLs:
 
 Prerequisites: Python 3.12+. Input files must be UTF-8 (an optional
 leading byte-order mark is accepted and stripped); the default maximum
-input size is 10 MiB, overridable with `--max-bytes`.
+input size is 10 MiB (for `.csv.gz`, after decompression), overridable
+with `--max-bytes`.
 
 Run all commands below from the repository root.
 
@@ -256,7 +257,7 @@ local CLI distinguishes them directly, through its exit code (`1` vs
 Final job statuses: `completed`, `completed_with_rejections`,
 `validation_failed`, and `duplicate_content`. Not final: `processing`,
 `failed` (will be retried), and `dead_lettered` (retrying stopped; see
-[Reliability and limitations](#reliability-and-limitations)).
+[decision record 0013](docs/decisions/0013-dead-lettered-status.md)).
 
 </details>
 
@@ -318,7 +319,7 @@ Two separate Terraform roots:
 | Root | Purpose |
 |---|---|
 | `infra/bootstrap` | Creates the S3 bucket that holds the main stack's Terraform state. Uses local state itself. |
-| `infra` | The application stack: S3 buckets, SQS, Lambda, DynamoDB, SNS, CloudWatch, Glue, Athena. Uses an S3 backend. |
+| `infra` | The application stack: S3 buckets, SQS, Lambda, DynamoDB, SNS, EventBridge, API Gateway, KMS, CloudWatch, Glue, Athena. Uses an S3 backend. |
 
 `aws_region` and `project_name` must be set to the same values in both
 roots. `infra/bootstrap` names the state bucket and, when GitHub OIDC is
@@ -372,6 +373,7 @@ list with defaults):
 | `aws_region` | Region for every resource (default `us-east-2`). Some AWS accounts restrict which regions general workloads may run in via an AWS Organizations Service Control Policy; if resource creation fails with a region-specific authorization error, check for such a policy and set `aws_region` accordingly. |
 | `notification_email` | Subscribes an email address to the SNS topic. Empty by default. |
 | `lambda_max_concurrency` | Caps concurrent Lambda invocations from the SQS trigger (2-1000, default 5). |
+| `lambda_memory_mb` | Processor memory, which also sets its CPU share (default 1024; sized so the largest allowed file finishes well inside the 60 s timeout, see [docs/costs.md](docs/costs.md#timeout-headroom)). |
 | `schema_name` | Bundled schema the Lambda uses (default `sales`); also names the Athena table. |
 | `enable_athena` | Creates the Glue table, Athena workgroup, and query-results bucket (default `true`, when the schema has a `curated` section). |
 | `athena_bytes_scanned_cutoff` | Athena cancels any single query that would scan more than this (default 1 GiB). |
@@ -446,7 +448,7 @@ applied from a laptop, before a GitHub deploy can create it.
 
 ## AWS Usage
 
-Via the AWS console: upload a `.csv` object to the input bucket, then
+Via the AWS console: upload a `.csv` or `.csv.gz` object to the input bucket, then
 download the report from `reports/{job_id}/` in the output bucket once
 processing completes (see the note above on which outcomes produce a
 report to download).
@@ -509,6 +511,16 @@ A reprocessed job overwrites its own outputs, so nothing is counted
 twice. If `upload_retention_days` is set, jobs whose upload has expired
 are listed as skipped rather than queued.
 
+When a job ends `dead_lettered` because AWS kept failing (not because of
+the file), its message waits in the dead-letter queue for 14 days. After
+fixing the cause, send every waiting message back for another attempt
+(both values come from `terraform output`: `dead_letter_queue_url` and
+`processing_queue_arn`):
+
+```bash
+scripts/redrive_dlq.sh <dead-letter-queue-url> <processing-queue-arn>
+```
+
 ### Monitoring and events
 
 The CloudWatch dashboard named after `project_name` shows job outcomes,
@@ -568,56 +580,6 @@ and 0.38 USD per 1,000 files at the 10 MiB limit, plus about 1 USD a
 month for the KMS key once free tiers apply. Per-hour metric charges,
 storage growth and the method are in [docs/costs.md](docs/costs.md).
 
-## Reliability and Limitations
-
-- **Job identity.** The job ID is deterministic: `sha256(bucket + "\n" +
-  key + "\n" + version_id)`. Re-delivering the same S3 event always
-  produces the same job ID, which is what lets duplicate events be
-  detected.
-- **Duplicate delivery.** SQS and S3 event delivery are at-least-once. A
-  duplicate event for an already-terminal job (`completed`,
-  `completed_with_rejections`, `validation_failed`, or
-  `duplicate_content`) does not reprocess the CSV; only
-  `scripts/reprocess.py` does, on request. A failed or interrupted attempt is retried and can genuinely
-  process the CSV again -- that is the intended recovery path.
-- **Duplicate content.** A new upload of the same bytes (same or
-  different key) is a new S3 version and therefore a new job, but its
-  SHA-256 matches a job that already completed, so it ends as
-  `duplicate_content` with `duplicate_of` naming the original, writes no
-  reports or curated rows, and says so in its notification. If the
-  original is still in progress, the duplicate is retried until the
-  original finishes. Only files that produced totals are fingerprinted,
-  and content is compared byte for byte -- see
-  [decision record 0009](docs/decisions/0009-duplicate-content-fingerprints.md).
-- **When retrying stops.** On the last allowed delivery a retryable
-  failure marks the job `dead_lettered`, sends a notification, and lets
-  the message move to the dead-letter queue; `scripts/redrive_dlq.sh`
-  resumes it. An error raised by the processing code itself would recur
-  on every attempt, so that job is dead-lettered at once and the
-  notification names the reprocess command
-  ([decision record 0013](docs/decisions/0013-dead-lettered-status.md)).
-- **Lease-conditioned writes.** DynamoDB job-record updates after the
-  initial claim require the matching lease token, so a worker whose lease
-  has been taken over by a newer attempt cannot overwrite that attempt's
-  result there. The S3 writes do not check the token, but they cannot
-  race either: the Lambda timeout (60 s) is shorter than the lease
-  (120 s), so a worker is stopped before its lease can be taken over.
-- **Report writes.** `summary.json` and `rejected_rows.csv` are written
-  through two separate `PutObject` calls, not one atomic operation, at
-  fixed keys, so a retry corrects a partial write from an earlier failed
-  attempt. Because the output bucket is versioned, each retry's writes add
-  new object versions rather than replacing history. Curated files are
-  written in the same step and are byte-for-byte deterministic, so a
-  retry rewrites them identically. `manifest.json` is written last and
-  lists every output with its SHA-256: until it exists, the job's
-  outputs are incomplete.
-- **Notifications and events.** Publishing to SNS and EventBridge and
-  recording that success in DynamoDB are separate operations, so a
-  subscriber can occasionally receive a duplicate notification or event
-  for the same job. A successful SNS
-  `Publish` call means SNS accepted the message for delivery to confirmed
-  subscribers, not that a particular subscriber received it.
-
 ## Testing
 
 ```bash
@@ -656,12 +618,13 @@ the Python side; it is skipped when Terraform is not installed.
 checkov exceptions are deliberate and each has its reason, in
 [`.checkov.yaml`](.checkov.yaml) or beside the resource.
 
-For a deployed stack, `make smoke` ([`scripts/smoke_test.py`](scripts/smoke_test.py))
-uploads a freshly generated file and checks that reports match the local
-CLI byte for byte, that manifest hashes match, that Athena agrees with
-the report, that a re-upload is caught as a duplicate, and that the
-portal's upload, downloads, and signed links work. It leaves its files
-behind as job history.
+For a deployed stack, `AWS_PROFILE=<profile> make smoke`
+([`scripts/smoke_test.py`](scripts/smoke_test.py)) uploads a freshly
+generated file and checks that reports match the local CLI byte for
+byte, that manifest hashes match, that Athena agrees with the report,
+that a re-upload is caught as a duplicate, and that the portal's upload,
+downloads, and signed links work. It leaves its files behind as job
+history.
 
 ## Project Structure
 
