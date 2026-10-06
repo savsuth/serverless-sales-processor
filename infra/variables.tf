@@ -60,21 +60,21 @@ variable "athena_month_range" {
 }
 
 # --- Lambda sizing ---------------------------------------------------------
-# Conservative defaults for a CSV up to 10 MiB. Revenue/quantity aggregation
-# scales with distinct product count (held in memory), not row count, and
-# rows themselves are streamed -- so memory needs are modest even for a
-# file with a lot of rows, as long as the product cardinality stays sane.
+# Sized from measurements on the deployed stack (docs/costs.md). Processing
+# is CPU-bound and costs about 0.12 ms per row at 512 MB; the worst case
+# is a 10 MiB file of the shortest valid rows (about 617,000 rows). Lambda
+# gives CPU in proportion to memory, so memory is the lever for time.
 
 variable "lambda_timeout_seconds" {
-  description = "Lambda function timeout. 60s comfortably covers parsing/aggregating a 10 MiB CSV plus S3/DynamoDB/SNS round trips with margin."
+  description = "Lambda function timeout. At the default 1024 MB the worst-case 10 MiB file needs about 34 s (measured scaling, docs/costs.md), leaving headroom. Must stay below job_lease_seconds."
   type        = number
   default     = 60
 }
 
 variable "lambda_memory_mb" {
-  description = "Lambda memory. 512 MB gives headroom for Decimal-heavy aggregation and CPython overhead without over-provisioning for a bounded 10 MiB input."
+  description = "Lambda memory, which also sets its CPU share. 1024 MB keeps the worst-case 10 MiB file (about 617,000 short rows) well inside the 60 s timeout; at 512 MB it would need about 67 s. Peak memory measured for a 10 MB file is about 210 MB, so the setting is about CPU, not memory. Cost per file barely changes, because CPU-bound work finishes proportionally faster."
   type        = number
-  default     = 512
+  default     = 1024
 }
 
 variable "lambda_max_concurrency" {

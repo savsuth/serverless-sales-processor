@@ -28,3 +28,4 @@ reliability, monitoring, the portal, encryption, CI, environments).
 | [0017](0017-customer-managed-key.md) | Data at rest uses one customer-managed KMS key |
 | [0018](0018-quality-gates.md) | CI enforces types, coverage, dependency audit and a Terraform scan |
 | [0019](0019-environments.md) | Environments are separate stacks, selected by prefix and state file |
+| [0020](0020-memory-sized-for-cpu.md) | The processor's memory is sized for CPU, from measurements |

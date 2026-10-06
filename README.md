@@ -557,6 +557,13 @@ output existed are not in the table; re-upload such a file once to add
 it (it has no content fingerprint, so it is not treated as a duplicate).
 Design notes: [decision record 0010](docs/decisions/0010-curated-json-lines-for-athena.md).
 
+## Costs
+
+Measured on the deployed stack: about 0.09 USD per 1,000 small files
+and 0.38 USD per 1,000 files at the 10 MiB limit, plus about 1 USD a
+month for the KMS key once free tiers apply. Per-hour metric charges,
+storage growth and the method are in [docs/costs.md](docs/costs.md).
+
 ## Reliability and Limitations
 
 - **Job identity.** The job ID is deterministic: `sha256(bucket + "\n" +
@@ -676,6 +683,7 @@ infra/              # Terraform (main stack)
 infra/envs/         # Templates for extra environments (dev)
 infra/bootstrap/    # Terraform (state bucket, optional OIDC role)
 docs/decisions/     # Design decision records
+docs/costs.md       # Measured cost per file and per month
 docs/queries/       # Example Athena queries (saved in the workgroup)
 docs/diagrams/      # Diagram sources (HTML); exported SVGs are in docs/
 scripts/            # Upload, status, report, list, reprocess, redrive,
