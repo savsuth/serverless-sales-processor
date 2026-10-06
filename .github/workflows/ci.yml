@@ -21,7 +21,7 @@ jobs:
 
       # Lets tests/test_terraform_schema.py run instead of skipping. The
       # wrapper is off so `terraform console` output stays plain.
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.16.4"
           terraform_wrapper: false
@@ -77,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.16.4"
 
