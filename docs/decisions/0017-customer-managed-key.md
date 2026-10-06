@@ -33,3 +33,11 @@ The Lambda roles may only Decrypt and GenerateDataKey on this key.
   wrong key policy fails silently, the key is rolled out in its own
   apply, after the rest of the stack is verified, and smoke-tested on
   its own.
+- The queues set `sqs_managed_sse_enabled` only when the key is off
+  (`null` otherwise): the AWS provider rejects the attribute next to
+  `kms_master_key_id`, even as `false`, and `terraform validate` does
+  not catch it. The first rollout stopped on that error after the
+  buckets, table, topic and log groups had switched to the key but
+  before the processor's role could use it, so for about two minutes
+  an upload would have failed and waited in SQS for a retry. The
+  second apply finished the switch, and the smoke test passed.

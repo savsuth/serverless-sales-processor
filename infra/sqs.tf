@@ -15,7 +15,7 @@ locals {
 resource "aws_sqs_queue" "dlq" {
   name                      = "${var.project_name}-dlq"
   message_retention_seconds = var.dlq_message_retention_seconds
-  sqs_managed_sse_enabled   = !var.enable_kms
+  sqs_managed_sse_enabled   = var.enable_kms ? null : true
   kms_master_key_id         = local.kms_key_arn
 }
 
@@ -23,7 +23,7 @@ resource "aws_sqs_queue" "processing" {
   name                       = "${var.project_name}-processing"
   visibility_timeout_seconds = local.sqs_visibility_timeout_seconds
   message_retention_seconds  = var.sqs_message_retention_seconds
-  sqs_managed_sse_enabled    = !var.enable_kms
+  sqs_managed_sse_enabled    = var.enable_kms ? null : true
   kms_master_key_id          = local.kms_key_arn
 
   redrive_policy = jsonencode({
