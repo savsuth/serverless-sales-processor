@@ -1,5 +1,8 @@
 # Serverless Sales Processor
 
+[![CI](https://github.com/savsuth/serverless-sales-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/savsuth/serverless-sales-processor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Serverless Sales Processor turns a sales CSV into revenue and quantity
 totals for each product. It checks every row, totals the valid ones, and
 lists each invalid row with the reason it was rejected, so one bad line
@@ -707,5 +710,10 @@ docs/diagrams/      # Diagram sources (HTML); exported SVGs are in docs/
 scripts/            # Upload, status, report, list, reprocess, redrive,
                     # smoke-test, and teardown helpers
 Makefile            # Everyday commands (make help)
+LICENSE             # MIT
 .github/            # CI (always), deploy (manual, gated), Dependabot
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
