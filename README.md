@@ -113,6 +113,8 @@ short-lived signed URLs:
 
 ![Portal: the upload page calls API Gateway with its token and uploads straight to the S3 input bucket with a presigned form; signed email links pass through API Gateway to the portal function, which reads job status from DynamoDB and redirects downloads to short-lived URLs on the output bucket.](docs/portal.svg)
 
+The diagram sources (HTML) are in [`docs/diagrams/`](docs/diagrams/).
+
 ## Local quick start
 
 You need Python 3.12 or later. Run every command from the repository
@@ -679,40 +681,6 @@ generated file and checks that:
 - the portal's upload, downloads, and signed links work.
 
 It leaves its files behind as job history.
-
-## Project structure
-
-```
-src/file_pipeline/
-  processor.py      # CSV validation and aggregation (no AWS dependency)
-  schema.py         # Schema file format and validation
-  schemas/          # Bundled schemas (sales.json)
-  curated.py        # Curated rows for Athena
-  local.py          # CLI runner
-  storage.py        # S3 reads/writes, manifest
-  jobs.py           # DynamoDB job state, claims, leases, content fingerprints
-  notifications.py  # SNS messages, EventBridge events
-  handler.py        # SQS-triggered Lambda entry point
-  portal.py         # Upload/status/link API (behind API Gateway)
-  links.py          # Signed report links
-  admin.py          # Listing and reprocessing jobs (operator side)
-tests/              # pytest; moto for AWS interaction tests
-tests/golden/       # Snapshot outputs for every sample
-samples/            # Example CSVs, one per validation scenario
-tools/upload.html   # Local upload page
-infra/              # Terraform (main stack)
-infra/envs/         # Templates for extra environments (dev)
-infra/bootstrap/    # Terraform (state bucket, optional OIDC role)
-docs/decisions/     # Design decision records
-docs/costs.md       # Measured cost per file and per month
-docs/queries/       # Example Athena queries (saved in the workgroup)
-docs/diagrams/      # Diagram sources (HTML); exported SVGs are in docs/
-scripts/            # Upload, status, report, list, reprocess, redrive,
-                    # smoke-test, and teardown helpers
-Makefile            # Everyday commands (make help)
-LICENSE             # MIT
-.github/            # CI (always), deploy (manual, gated), Dependabot
-```
 
 ## License
 
