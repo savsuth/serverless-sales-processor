@@ -1,0 +1,31 @@
+{
+  "by_product": {
+    "Gadget": {
+      "quantity": 1,
+      "revenue": "19.50"
+    },
+    "WIDGET": {
+      "quantity": 7,
+      "revenue": "1058.940"
+    }
+  },
+  "rejected_row_count": 0,
+  "total_revenue": "1078.440",
+  "valid_row_count": 6,
+  "warnings": {
+    "duplicate_rows": {
+      "count": 2,
+      "row_numbers": [
+        2,
+        4
+      ]
+    },
+    "outliers": {
+      "column": "unit_price",
+      "count": 1,
+      "row_numbers": [
+        5
+      ]
+    }
+  }
+}

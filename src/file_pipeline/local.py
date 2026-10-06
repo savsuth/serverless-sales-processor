@@ -93,6 +93,9 @@ def run(
             ]
         )
     )
+    flagged = [f"{name}={w['count']}" for name, w in result.warnings.items() if w["count"]]
+    if flagged:
+        print(f"warnings: {', '.join(flagged)} (row numbers in summary.json)")
     print(f"wrote {summary_path}")
     print(f"wrote {rejected_path}")
     if result.error_code:

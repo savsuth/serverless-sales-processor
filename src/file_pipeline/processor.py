@@ -12,6 +12,8 @@ Design decisions (documented here because the task spec leaves them open):
 
 * Column matching is case-insensitive and ignores surrounding whitespace,
   e.g. " Date" and "date" both satisfy the "date" requirement.
+* The field separator is chosen per file from the schema's `delimiters`:
+  the first one that splits the header into all the required columns.
 * Duplicate header names (after normalization) make the whole file
   malformed, because we can no longer say which column a value belongs to.
 * Extra, unrecognized columns are allowed. Their values are preserved
@@ -31,6 +33,11 @@ Design decisions (documented here because the task spec leaves them open):
 * Monetary values are Decimal throughout and serialized as plain decimal
   strings (no scientific notation, no float) to avoid float rounding
   error and precision loss.
+* A gzip-compressed file is recognized by its first two bytes (not its
+  name) and decompressed while streaming. The size limit and the content
+  fingerprint both apply to the decompressed CSV, so a compression bomb
+  is stopped at the limit and the same data compressed or not is the
+  same content.
 * rejected_rows.csv values are defended against spreadsheet formula
   injection: any field beginning with '=', '+', '-', '@', a tab, or a
   carriage return is prefixed with a leading apostrophe before being
@@ -43,15 +50,19 @@ from __future__ import annotations
 
 import csv
 import datetime
+import gzip
 import hashlib
 import io
+import itertools
 import re
+import statistics
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import IO, Any, TextIO
+from typing import IO, Any, Protocol, TextIO
 
-from file_pipeline.schema import Column, Schema, load_schema
+from file_pipeline.schema import Column, OutlierRule, Schema, load_schema
 
 MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MiB
 
@@ -74,6 +85,9 @@ _NON_FINITE_TOKENS = {
 _FORMULA_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 REJECTED_CSV_EXTRA_COLUMNS = ("row_number", "rejection_reason")
+
+# A warning lists at most this many row numbers; its count is always exact.
+MAX_WARNING_ROW_NUMBERS = 20
 
 STATUS_COMPLETED = "completed"
 STATUS_COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
@@ -122,7 +136,10 @@ class ProcessingResult:
     both are None otherwise.
 
     `content_sha256` is the SHA-256 of the file's exact bytes, used to
-    recognize the same content uploaded again (see jobs.claim_content)."""
+    recognize the same content uploaded again (see jobs.claim_content).
+
+    `warnings` holds the schema's warning checks that ran, e.g.
+    {"duplicate_rows": {"count": 1, "row_numbers": [7]}}."""
 
     status: str
     valid_row_count: int
@@ -133,6 +150,7 @@ class ProcessingResult:
     error_code: str | None = None
     error_message: str | None = None
     content_sha256: str = ""
+    warnings: dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, name: str) -> Any:
         schema = self.__dict__.get("schema")
@@ -144,13 +162,45 @@ class ProcessingResult:
         raise AttributeError(name)
 
 
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+class _Readable(Protocol):
+    """Anything with .read(n): a file, an S3 StreamingBody, a GzipFile."""
+
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+class _StreamReader(io.RawIOBase):
+    """Adapts any object with .read(n) (a file, an S3 StreamingBody) to
+    the raw-stream interface io.BufferedReader needs."""
+
+    def __init__(self, source: _Readable) -> None:
+        self._source = source
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:
+        data = self._source.read(len(b))
+        b[: len(data)] = data
+        return len(data)
+
+
+def _decompressed(binary_stream: _Readable) -> io.BufferedIOBase:
+    buffered = io.BufferedReader(_StreamReader(binary_stream))
+    if buffered.peek(len(GZIP_MAGIC))[: len(GZIP_MAGIC)] == GZIP_MAGIC:
+        return gzip.GzipFile(fileobj=buffered, mode="rb")
+    return buffered
+
+
 class _CountingRawReader(io.RawIOBase):
     """Wraps any object with .read(n) and enforces a byte ceiling while
     streaming, so an oversized or mislabeled input is caught mid-read
     instead of only after being fully buffered. Also fingerprints the
     bytes as they pass, so no second read is needed."""
 
-    def __init__(self, source: IO[bytes], max_bytes: int) -> None:
+    def __init__(self, source: _Readable, max_bytes: int) -> None:
         self._source = source
         self._max_bytes = max_bytes
         self._read_bytes = 0
@@ -159,7 +209,7 @@ class _CountingRawReader(io.RawIOBase):
     def readable(self) -> bool:
         return True
 
-    def readinto(self, b: bytearray) -> int:  # type: ignore[override]
+    def readinto(self, b: Any) -> int:
         data = self._source.read(len(b))
         if not data:
             return 0
@@ -189,6 +239,18 @@ def _open_text_stream(raw: _CountingRawReader) -> TextIO:
 
 def _normalize_header_name(name: str) -> str:
     return name.strip().lower()
+
+
+def _detect_delimiter(header_line: str, schema: Schema) -> str:
+    """The first of the schema's delimiters that splits the header line
+    into all the required columns. Falls back to the first delimiter, so
+    a file matching none fails header validation with the usual error."""
+    required = set(schema.column_names)
+    for delimiter in schema.delimiters:
+        fields = next(csv.reader([header_line], delimiter=delimiter), [])
+        if required <= {_normalize_header_name(f) for f in fields}:
+            return delimiter
+    return schema.delimiters[0]
 
 
 def _validate_header(header: list[str], schema: Schema) -> dict[str, int]:
@@ -270,9 +332,72 @@ def _validate_row(
     return values, None
 
 
+def _comparable(value: Any, ignore_case: bool) -> Any:
+    if isinstance(value, Decimal):
+        return value.normalize()  # 9.99 and 9.990 are the same price
+    if ignore_case:
+        return value.lower()
+    return value
+
+
+class _DuplicateRows:
+    """Spots valid rows whose values all equal an earlier valid row's.
+    Keeps a 16-byte digest per distinct row, not the row itself."""
+
+    def __init__(self, schema: Schema) -> None:
+        self._columns = [(c.name, c.case_insensitive) for c in schema.columns]
+        self._seen: set[bytes] = set()
+        self.row_numbers: list[int] = []
+
+    def add(self, row_number: int, values: dict[str, Any]) -> None:
+        key = tuple(_comparable(values[name], ignore_case) for name, ignore_case in self._columns)
+        digest = hashlib.blake2b(repr(key).encode(), digest_size=16).digest()
+        if digest in self._seen:
+            self.row_numbers.append(row_number)
+        else:
+            self._seen.add(digest)
+
+
+class _Outliers:
+    """Collects one numeric column per group, then flags values more than
+    `factor` times away from their group's median."""
+
+    def __init__(self, rule: OutlierRule, schema: Schema) -> None:
+        self._rule = rule
+        self._ignore_case = schema.column(rule.per).case_insensitive
+        self._groups: dict[Any, list[tuple[Decimal, int]]] = {}
+
+    def add(self, row_number: int, values: dict[str, Any]) -> None:
+        key = _comparable(values[self._rule.per], self._ignore_case)
+        value = Decimal(values[self._rule.column])
+        self._groups.setdefault(key, []).append((value, row_number))
+
+    def row_numbers(self) -> list[int]:
+        factor = self._rule.factor
+        flagged = []
+        for entries in self._groups.values():
+            if len(entries) < 3:
+                continue
+            median = statistics.median(value for value, _ in entries)
+            if median <= 0:
+                continue
+            flagged += [
+                n for value, n in entries if value > median * factor or value * factor < median
+            ]
+        return sorted(flagged)
+
+
+def _warning(row_numbers: list[int], **extra: Any) -> dict[str, Any]:
+    return {
+        **extra,
+        "count": len(row_numbers),
+        "row_numbers": row_numbers[:MAX_WARNING_ROW_NUMBERS],
+    }
+
+
 def process_csv(
     binary_stream: IO[bytes],
-    rejected_csv_writer_target: TextIO,
+    rejected_csv_writer_target: IO[str],
     *,
     max_bytes: int = MAX_INPUT_BYTES,
     schema: Schema | None = None,
@@ -291,14 +416,15 @@ def process_csv(
     written to it is incomplete and must be discarded by the caller.
     """
     schema = schema or load_schema()
-    raw = _CountingRawReader(binary_stream, max_bytes)
+    raw = _CountingRawReader(_decompressed(binary_stream), max_bytes)
     try:
         text_stream = _open_text_stream(raw)
-        reader = csv.reader(text_stream)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise MalformedCSVError("empty_file", "CSV file is empty") from None
+        header_line = text_stream.readline()
+        if not header_line:
+            raise MalformedCSVError("empty_file", "CSV file is empty")
+        delimiter = _detect_delimiter(header_line, schema)
+        reader = csv.reader(itertools.chain([header_line], text_stream), delimiter=delimiter)
+        header = next(reader)
 
         column_index = _validate_header(header, schema)
         header_len = len(header)
@@ -313,7 +439,15 @@ def process_csv(
         totals: dict[str, int | Decimal] = {
             m.name: Decimal("0") if m.is_decimal else 0 for m in schema.measures if m.total
         }
-        groups: dict[str, GroupTotals] = {}
+        # Groups are keyed by the value as compared (lowercased for a
+        # case_insensitive column, matching Athena's lower()) and reported
+        # under the alphabetically first spelling, so row order never
+        # changes the report.
+        group_case_insensitive = schema.column(schema.group_by).case_insensitive
+        groups_by_key: dict[str, GroupTotals] = {}
+        group_names: dict[str, str] = {}
+        duplicate_rows = _DuplicateRows(schema) if schema.warn_duplicate_rows else None
+        outliers = _Outliers(schema.outliers, schema) if schema.outliers else None
 
         row_number = 0
         for row in reader:
@@ -341,13 +475,20 @@ def process_csv(
                 row_measures[measure.name] = amount
                 if measure.total:
                     totals[measure.name] += amount
+            group_value = values[schema.group_by]
+            group_key = group_value.lower() if group_case_insensitive else group_value
+            group_names[group_key] = min(group_names.get(group_key, group_value), group_value)
+
             if on_valid_row is not None:
                 on_valid_row(row_number, values, row_measures)
+            if duplicate_rows is not None:
+                duplicate_rows.add(row_number, values)
+            if outliers is not None:
+                outliers.add(row_number, values)
 
-            group_key = values[schema.group_by]
-            existing = groups.get(group_key)
+            existing = groups_by_key.get(group_key)
             if existing is None:
-                groups[group_key] = GroupTotals(row_measures)
+                groups_by_key[group_key] = GroupTotals(row_measures)
             else:
                 for name, amount in row_measures.items():
                     existing[name] += amount
@@ -355,6 +496,17 @@ def process_csv(
         raise MalformedCSVError("invalid_encoding", str(exc)) from exc
     except csv.Error as exc:
         raise MalformedCSVError("csv_parse_error", str(exc)) from exc
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise MalformedCSVError(
+            "invalid_gzip", "File starts like gzip but could not be decompressed"
+        ) from exc
+
+    warnings: dict[str, Any] = {}
+    if duplicate_rows is not None:
+        warnings["duplicate_rows"] = _warning(duplicate_rows.row_numbers)
+    if outliers is not None:
+        assert schema.outliers is not None
+        warnings["outliers"] = _warning(outliers.row_numbers(), column=schema.outliers.column)
 
     error_code = error_message = None
     row_count = valid_row_count + rejected_row_count
@@ -381,10 +533,11 @@ def process_csv(
         rejected_row_count=rejected_row_count,
         schema=schema,
         totals=totals,
-        groups=groups,
+        groups={group_names[key]: totals_ for key, totals_ in groups_by_key.items()},
         error_code=error_code,
         error_message=error_message,
         content_sha256=raw.sha256.hexdigest(),
+        warnings=warnings,
     )
 
 
@@ -409,6 +562,8 @@ def build_summary_dict(result: ProcessingResult) -> dict:
     }
     for name, amount in result.totals.items():
         summary[f"total_{name}"] = _serialize_amount(amount)
+    if result.warnings:
+        summary["warnings"] = result.warnings
     return summary
 
 

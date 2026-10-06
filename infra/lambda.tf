@@ -25,6 +25,11 @@ resource "aws_lambda_function" "processor" {
 
   filename         = data.archive_file.lambda_package.output_path
   source_code_hash = data.archive_file.lambda_package.output_base64sha256
+  kms_key_arn      = local.kms_key_arn
+
+  tracing_config {
+    mode = "Active"
+  }
 
   # Concurrency is capped on the SQS event source mapping below, NOT with
   # reserved_concurrent_executions: when reserved concurrency throttles an
@@ -41,6 +46,13 @@ resource "aws_lambda_function" "processor" {
       LEASE_SECONDS          = tostring(var.job_lease_seconds)
       MAX_INPUT_BYTES        = tostring(var.max_input_bytes)
       SCHEMA_NAME            = var.schema_name
+      MAX_RECEIVE_COUNT      = tostring(var.sqs_max_receive_count)
+      METRICS_NAMESPACE      = local.metrics_namespace
+      EVENT_BUS_NAME         = var.enable_events ? "default" : ""
+      EVENT_SOURCE           = var.project_name
+      PORTAL_URL             = local.portal_url
+      LINK_SIGNING_KEY       = local.link_signing_key
+      REPORT_LINK_DAYS       = tostring(var.report_link_days)
       LOG_LEVEL              = "INFO"
     }
   }

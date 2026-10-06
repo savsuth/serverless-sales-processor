@@ -23,13 +23,15 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
-from file_pipeline import jobs, notifications, storage
+from file_pipeline import jobs, links, notifications, storage
 from file_pipeline.curated import CuratedWriter
 from file_pipeline.processor import (
     MAX_INPUT_BYTES,
@@ -49,7 +51,7 @@ class _StdoutHandler(logging.StreamHandler):
         super().__init__(sys.stdout)
 
     @property
-    def stream(self):  # type: ignore[override]
+    def stream(self):
         return sys.stdout
 
     @stream.setter
@@ -70,6 +72,11 @@ if not logger.handlers:
 
 REJECTED_BUFFER_SPOOL_BYTES = 1024 * 1024
 
+# Errors that can interrupt reading the object mid-stream (network, S3).
+# Any other exception raised while processing comes from this code
+# itself and would recur on every attempt with the same bytes.
+TRANSIENT_READ_ERRORS = (BotoCoreError, ClientError, OSError)
+
 
 def _describe_exception(exc: Exception) -> str:
     """A safe, content-free description for the job record and logs. Raw
@@ -89,6 +96,41 @@ def _log(level: int, message: str, **fields: Any) -> None:
     logger.log(level, json.dumps(payload, default=str))
 
 
+def _emit_attempt_metrics(
+    namespace: str, job_id: str, record: dict[str, Any], duration_ms: int
+) -> None:
+    """One CloudWatch Embedded Metric Format line per finished attempt:
+    CloudWatch turns it into metrics (dimension Status) with no API call
+    and no extra IAM permission. Counts only, never row content."""
+    status = record["status"]
+    payload = {
+        "level": "INFO",
+        "message": "job_attempt_metrics",
+        "job_id": job_id,
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": namespace,
+                    "Dimensions": [["Status"]],
+                    "Metrics": [
+                        {"Name": "JobAttempts", "Unit": "Count"},
+                        {"Name": "ValidRows", "Unit": "Count"},
+                        {"Name": "RejectedRows", "Unit": "Count"},
+                        {"Name": "ProcessingMs", "Unit": "Milliseconds"},
+                    ],
+                }
+            ],
+        },
+        "Status": status,
+        "JobAttempts": 1,
+        "ValidRows": int(record.get("valid_row_count", 0)),
+        "RejectedRows": int(record.get("rejected_row_count", 0)),
+        "ProcessingMs": duration_ms,
+    }
+    logger.info(json.dumps(payload, default=str))
+
+
 def _log_info(message: str, **fields: Any) -> None:
     _log(logging.INFO, message, **fields)
 
@@ -105,6 +147,12 @@ class Dependencies:
     output_bucket: str
     max_input_bytes: int = MAX_INPUT_BYTES
     schema: Schema = field(default_factory=load_schema)
+    # Must match the queue's redrive maxReceiveCount: the delivery with
+    # this receive count is the last one before the dead-letter queue.
+    max_receive_count: int = 5
+    metrics_namespace: str = "CsvSalesPipeline"
+    events: notifications.EventPublisher | None = None
+    report_links: links.ReportLinks | None = None
 
 
 def _default_dependencies() -> Dependencies:
@@ -114,15 +162,42 @@ def _default_dependencies() -> Dependencies:
     table = dynamodb.Table(os.environ["JOB_TABLE_NAME"])
     lease_seconds = int(os.environ.get("LEASE_SECONDS", jobs.DEFAULT_LEASE_SECONDS))
 
+    schema = load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA))
+    bus_name = os.environ.get("EVENT_BUS_NAME", "")
+    events = (
+        notifications.EventPublisher(
+            boto3.client("events"), bus_name, os.environ.get("EVENT_SOURCE", "csv-sales-pipeline")
+        )
+        if bus_name
+        else None
+    )
+
+    portal_url = os.environ.get("PORTAL_URL", "")
+    report_links = (
+        links.ReportLinks(
+            base_url=portal_url,
+            key=os.environ["LINK_SIGNING_KEY"].encode(),
+            valid_seconds=int(os.environ.get("REPORT_LINK_DAYS", 7)) * 86400,
+        )
+        if portal_url
+        else None
+    )
+
     return Dependencies(
-        job_store=jobs.JobStore(table, lease_seconds=lease_seconds),
+        job_store=jobs.JobStore(
+            table, lease_seconds=lease_seconds, rules=(schema.name, schema.version)
+        ),
         object_storage=storage.S3Storage(boto3.client("s3")),
         notifier=notifications.SNSNotifier(
             boto3.client("sns"), os.environ["NOTIFICATION_TOPIC_ARN"]
         ),
         output_bucket=os.environ["OUTPUT_BUCKET_NAME"],
         max_input_bytes=int(os.environ.get("MAX_INPUT_BYTES", MAX_INPUT_BYTES)),
-        schema=load_schema(os.environ.get("SCHEMA_NAME", DEFAULT_SCHEMA)),
+        schema=schema,
+        max_receive_count=int(os.environ.get("MAX_RECEIVE_COUNT", 5)),
+        metrics_namespace=os.environ.get("METRICS_NAMESPACE", "CsvSalesPipeline"),
+        events=events,
+        report_links=report_links,
     )
 
 
@@ -174,13 +249,21 @@ def _process_sqs_record(record: dict, deps: Dependencies, *, message_id: str) ->
         _log_info("sqs_message_with_no_s3_records_ignored", sqs_message_id=message_id)
         return True
 
+    receive_count = int(record.get("attributes", {}).get("ApproximateReceiveCount", "1"))
+    final_attempt = receive_count >= deps.max_receive_count
+
     all_ok = True
     for s3_record in s3_records:
-        all_ok = _process_s3_record(s3_record, deps, message_id=message_id) and all_ok
+        ok = _process_s3_record(
+            s3_record, deps, message_id=message_id, final_attempt=final_attempt
+        )
+        all_ok = ok and all_ok
     return all_ok
 
 
-def _process_s3_record(s3_record: dict, deps: Dependencies, *, message_id: str) -> bool:
+def _process_s3_record(
+    s3_record: dict, deps: Dependencies, *, message_id: str, final_attempt: bool = False
+) -> bool:
     try:
         event_name = s3_record.get("eventName", "")
         if not event_name.startswith("ObjectCreated:"):
@@ -204,11 +287,23 @@ def _process_s3_record(s3_record: dict, deps: Dependencies, *, message_id: str) 
         _log_error("malformed_s3_event_record", sqs_message_id=message_id, error=str(exc))
         return False
 
+    if not storage.is_input_key(key):
+        _log_info("ignoring_non_csv_object", sqs_message_id=message_id, bucket=bucket)
+        return True
+
     job_id = jobs.compute_job_id(bucket, key, version_id)
-    return _process_job(job_id, bucket, key, version_id, deps)
+    return _process_job(job_id, bucket, key, version_id, deps, final_attempt=final_attempt)
 
 
-def _process_job(job_id: str, bucket: str, key: str, version_id: str, deps: Dependencies) -> bool:
+def _process_job(
+    job_id: str,
+    bucket: str,
+    key: str,
+    version_id: str,
+    deps: Dependencies,
+    *,
+    final_attempt: bool = False,
+) -> bool:
     claim = deps.job_store.claim(job_id, bucket, key, version_id)
 
     if claim.status in (jobs.ClaimStatus.ACTIVE_ELSEWHERE, jobs.ClaimStatus.LOST_RACE):
@@ -224,16 +319,47 @@ def _process_job(job_id: str, bucket: str, key: str, version_id: str, deps: Depe
 
     assert claim.status is jobs.ClaimStatus.OWNED
     assert claim.lease_token is not None
-    return _run_processing(job_id, bucket, key, version_id, claim.lease_token, deps)
+    started = time.monotonic()
+    ok = _run_processing(
+        job_id, bucket, key, version_id, claim.lease_token, deps, final_attempt=final_attempt
+    )
+    _record_attempt(job_id, claim.lease_token, deps, started)
+    return ok
+
+
+def _record_attempt(job_id: str, token: str, deps: Dependencies, started: float) -> None:
+    """Emits metrics for this attempt's outcome, read back from the job
+    record so every path (success, failure, duplicate, dead letter) is
+    covered in one place. Skipped if another worker owns the job now."""
+    try:
+        record = deps.job_store.get(job_id)
+    except Exception as exc:  # noqa: BLE001 - metrics must never fail a job
+        _log_error("attempt_metrics_unavailable", job_id=job_id, error=type(exc).__name__)
+        return
+    if record is None or record.get("lease_owner") != token:
+        return
+    if record["status"] == jobs.STATUS_PROCESSING:
+        return
+    duration_ms = int((time.monotonic() - started) * 1000)
+    _emit_attempt_metrics(deps.metrics_namespace, job_id, record, duration_ms)
 
 
 def _run_processing(
-    job_id: str, bucket: str, key: str, version_id: str, token: str, deps: Dependencies
+    job_id: str,
+    bucket: str,
+    key: str,
+    version_id: str,
+    token: str,
+    deps: Dependencies,
+    *,
+    final_attempt: bool = False,
 ) -> bool:
     try:
         content_length = deps.object_storage.head_object(bucket, key, version_id)
     except Exception as exc:  # noqa: BLE001 - classified as a temporary AWS error
-        return _fail(job_id, token, deps, error_code="s3_head_object_error", exc=exc)
+        return _fail(
+            job_id, token, deps, error_code="s3_head_object_error", exc=exc, final=final_attempt
+        )
 
     if content_length > deps.max_input_bytes:
         return _finish_validation_failed(
@@ -250,7 +376,9 @@ def _run_processing(
     try:
         handle = deps.object_storage.open_object(bucket, key, version_id)
     except Exception as exc:  # noqa: BLE001
-        return _fail(job_id, token, deps, error_code="s3_get_object_error", exc=exc)
+        return _fail(
+            job_id, token, deps, error_code="s3_get_object_error", exc=exc, final=final_attempt
+        )
 
     # Collects valid rows for Athena while the file streams; they are
     # only uploaded below if the job completes with new content.
@@ -283,8 +411,19 @@ def _run_processing(
                 error_code="input_too_large",
                 error_message=f"Input exceeded the {exc.max_bytes}-byte limit while streaming",
             )
-        except Exception as exc:  # noqa: BLE001 - unexpected processing failure
-            return _fail(job_id, token, deps, error_code="processing_error", exc=exc)
+        except TRANSIENT_READ_ERRORS as exc:
+            return _fail(
+                job_id, token, deps, error_code="s3_read_error", exc=exc, final=final_attempt
+            )
+        except Exception as exc:  # noqa: BLE001 - a bug: retrying the same bytes cannot help
+            return _dead_letter(
+                job_id,
+                token,
+                deps,
+                error_code="processing_error",
+                error_message=_describe_exception(exc),
+                in_queue=False,
+            )
 
         # Only a file that produced totals is checked for duplicate
         # content: re-running a failed file cannot double count anything.
@@ -292,7 +431,14 @@ def _run_processing(
             try:
                 content = deps.job_store.claim_content(result.content_sha256, job_id)
             except Exception as exc:  # noqa: BLE001 - temporary AWS error
-                return _fail(job_id, token, deps, error_code="content_claim_error", exc=exc)
+                return _fail(
+                    job_id,
+                    token,
+                    deps,
+                    error_code="content_claim_error",
+                    exc=exc,
+                    final=final_attempt,
+                )
             if content.status is jobs.ContentClaimStatus.DUPLICATE:
                 return _finish_duplicate(
                     job_id,
@@ -303,7 +449,11 @@ def _run_processing(
                 )
             if content.status is jobs.ContentClaimStatus.PENDING_ELSEWHERE:
                 return _wait_for_original(
-                    job_id, token, deps, original_job_id=content.first_job_id
+                    job_id,
+                    token,
+                    deps,
+                    original_job_id=content.first_job_id,
+                    final=final_attempt,
                 )
 
         # Reaching here with a completed status means this job owns the
@@ -319,10 +469,20 @@ def _run_processing(
                 summary_bytes,
                 rejected_bytes,
                 curated.files() if curated and completed else (),
+                manifest={
+                    "job_id": job_id,
+                    "status": result.status,
+                    "error_code": result.error_code,
+                    "schema": deps.schema.name,
+                    "schema_version": deps.schema.version,
+                    "content_sha256": result.content_sha256,
+                    "valid_row_count": result.valid_row_count,
+                    "rejected_row_count": result.rejected_row_count,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - temporary AWS error
             return _fail(
-                job_id, token, deps, error_code="s3_put_report_error", exc=exc
+                job_id, token, deps, error_code="s3_put_report_error", exc=exc, final=final_attempt
             )
 
     owned = deps.job_store.finalize_success(
@@ -336,6 +496,7 @@ def _run_processing(
         error_code=result.error_code,
         error_message=result.error_message,
         content_sha256=result.content_sha256,
+        warning_counts=_warning_counts(result.warnings),
     )
     if not owned:
         _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
@@ -352,7 +513,16 @@ def _run_processing(
         output_rejected_key=rejected_key,
         error_code=result.error_code,
         error_message=result.error_message,
+        warning_counts=_warning_counts(result.warnings),
     )
+
+
+def _int_or_none(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _warning_counts(warnings: dict[str, Any]) -> dict[str, int]:
+    return {name: warning["count"] for name, warning in warnings.items()}
 
 
 def _finish_validation_failed(
@@ -406,28 +576,139 @@ def _finish_duplicate(
 
 
 def _wait_for_original(
-    job_id: str, token: str, deps: Dependencies, *, original_job_id: str
+    job_id: str, token: str, deps: Dependencies, *, original_job_id: str, final: bool = False
 ) -> bool:
     """Another job is processing the same content and hasn't finished.
     Leave this message retryable: by a later delivery that job has
     completed (this one then ends as a duplicate) or failed and is
     itself being retried. Logged at INFO: waiting is not an error."""
+    error_message = f"Same content as job {original_job_id}, which has not finished yet"
+    if final:
+        return _dead_letter(
+            job_id,
+            token,
+            deps,
+            error_code="waiting_for_original_job",
+            error_message=error_message,
+            in_queue=True,
+        )
     deps.job_store.mark_failed(
-        job_id,
-        token,
-        error_code="waiting_for_original_job",
-        error_message=f"Same content as job {original_job_id}, which has not finished yet",
+        job_id, token, error_code="waiting_for_original_job", error_message=error_message
     )
     _log_info("duplicate_waiting_for_original_job", job_id=job_id, original_job_id=original_job_id)
     return False
 
 
-def _fail(job_id: str, token: str, deps: Dependencies, *, error_code: str, exc: Exception) -> bool:
+def _fail(
+    job_id: str,
+    token: str,
+    deps: Dependencies,
+    *,
+    error_code: str,
+    exc: Exception,
+    final: bool = False,
+) -> bool:
+    """A failure worth retrying. On the last allowed delivery the job is
+    dead-lettered instead, so it does not sit at "failed" forever."""
+    if final:
+        return _dead_letter(
+            job_id,
+            token,
+            deps,
+            error_code=error_code,
+            error_message=_describe_exception(exc),
+            in_queue=True,
+        )
     deps.job_store.mark_failed(
         job_id, token, error_code=error_code, error_message=_describe_exception(exc)
     )
     _log_error("job_processing_failed", job_id=job_id, error_code=error_code)
     return False
+
+
+def _dead_letter(
+    job_id: str,
+    token: str,
+    deps: Dependencies,
+    *,
+    error_code: str,
+    error_message: str,
+    in_queue: bool,
+) -> bool:
+    """Stops retrying a job and says how to resume it.
+
+    in_queue=True: the last allowed delivery failed; returning False lets
+    SQS move the message to the dead-letter queue, from which a redrive
+    resumes the job. in_queue=False: the error would recur on every
+    attempt, so the message is acknowledged now and the job is resumed
+    with scripts/reprocess.py once the cause is fixed."""
+    if not deps.job_store.mark_dead_lettered(
+        job_id, token, error_code=error_code, error_message=error_message
+    ):
+        _log_info("lease_lost_before_finalize_deferring_to_other_worker", job_id=job_id)
+        return True
+    _log_error("job_dead_lettered", job_id=job_id, error_code=error_code, in_queue=in_queue)
+
+    if in_queue:
+        next_step = (
+            "The message is in the dead-letter queue. Fix the cause, then move it "
+            "back with scripts/redrive_dlq.sh."
+        )
+    else:
+        next_step = (
+            "This error would repeat on every attempt, so retrying stopped. Fix the "
+            f"cause, then run: scripts/reprocess.py --job-id {job_id}"
+        )
+    subject, body = notifications.build_notification_message(
+        job_id=job_id,
+        status=jobs.STATUS_DEAD_LETTERED,
+        valid_row_count=None,
+        rejected_row_count=None,
+        output_bucket=None,
+        output_summary_key=None,
+        output_rejected_key=None,
+        error_code=error_code,
+        error_message=error_message,
+        next_step=next_step,
+    )
+    try:
+        deps.notifier.publish(job_id=job_id, subject=subject, body=body)
+    except Exception as exc:  # noqa: BLE001 - best effort; the job record and alarm remain
+        _log_error("sns_publish_failed", job_id=job_id, error=type(exc).__name__)
+    try:
+        _publish_event(
+            deps,
+            job_id,
+            detail_type="CSV job dead-lettered",
+            detail={
+                "status": jobs.STATUS_DEAD_LETTERED,
+                "error_code": error_code,
+                "in_dead_letter_queue": in_queue,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort, as above
+        _log_error("event_publish_failed", job_id=job_id, error=type(exc).__name__)
+    return not in_queue
+
+
+def _publish_event(
+    deps: Dependencies, job_id: str, *, detail_type: str, detail: dict[str, Any]
+) -> None:
+    """Publishes to EventBridge, if enabled, adding the job's source file
+    (read from the job record) so subscribers need no lookup."""
+    if deps.events is None:
+        return
+    record = deps.job_store.get(job_id) or {}
+    deps.events.publish(
+        detail_type=detail_type,
+        detail={
+            "job_id": job_id,
+            **detail,
+            "source_bucket": record.get("source_bucket"),
+            "source_key": record.get("source_key"),
+            "source_version_id": record.get("source_version_id"),
+        },
+    )
 
 
 def _ensure_notified(job_id: str, record: dict[str, Any], deps: Dependencies) -> bool:
@@ -453,6 +734,7 @@ def _ensure_notified(job_id: str, record: dict[str, Any], deps: Dependencies) ->
         error_code=record.get("error_code"),
         error_message=record.get("error_message"),
         duplicate_of=record.get("duplicate_of"),
+        warning_counts=record.get("warning_counts"),
     )
 
 
@@ -469,7 +751,12 @@ def _notify_and_ack(
     error_code: str | None,
     error_message: str | None,
     duplicate_of: str | None = None,
+    warning_counts: dict[str, int] | None = None,
 ) -> bool:
+    download_links = links_expire_at = None
+    if deps.report_links is not None and output_summary_key:
+        download_links, expires_at = deps.report_links.for_job(job_id, now=time.time())
+        links_expire_at = datetime.fromtimestamp(expires_at, UTC).strftime("%Y-%m-%d %H:%M UTC")
     subject, body = notifications.build_notification_message(
         job_id=job_id,
         status=status,
@@ -481,11 +768,36 @@ def _notify_and_ack(
         error_code=error_code,
         error_message=error_message,
         duplicate_of=duplicate_of,
+        warning_counts=warning_counts,
+        download_links=download_links,
+        links_expire_at=links_expire_at,
     )
     try:
         deps.notifier.publish(job_id=job_id, subject=subject, body=body)
     except Exception as exc:  # noqa: BLE001
         _log_error("sns_publish_failed", job_id=job_id, error=type(exc).__name__)
+        deps.job_store.mark_notification_result(job_id, lease_owner, sent=False)
+        return False
+
+    try:
+        _publish_event(
+            deps,
+            job_id,
+            detail_type="CSV job finished",
+            detail={
+                "status": status,
+                "valid_row_count": _int_or_none(valid_row_count),
+                "rejected_row_count": _int_or_none(rejected_row_count),
+                "error_code": error_code,
+                "duplicate_of": duplicate_of,
+                "warning_counts": {k: int(v) for k, v in (warning_counts or {}).items()},
+                "output_bucket": deps.output_bucket if output_summary_key else None,
+                "summary_key": output_summary_key,
+                "rejected_key": output_rejected_key,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - retried with the notification
+        _log_error("event_publish_failed", job_id=job_id, error=type(exc).__name__)
         deps.job_store.mark_notification_result(job_id, lease_owner, sent=False)
         return False
 

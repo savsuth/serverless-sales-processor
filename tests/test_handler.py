@@ -2,6 +2,7 @@
 emulation -- no real AWS credentials or network calls are used anywhere
 in this file (moto intercepts every boto3 call)."""
 
+import gzip
 import hashlib
 import json
 from decimal import Decimal
@@ -549,8 +550,11 @@ def test_unexpected_processing_error_never_stores_raw_exception_text(aws_stack, 
 
     result = handler.handle_event(event, make_deps(aws_stack))
 
-    assert result == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+    # A bug in processing would recur on every retry, so the message is
+    # acknowledged and the job parked as dead_lettered (see below).
+    assert result == {"batchItemFailures": []}
     job = get_job(aws_stack, job_id)
+    assert job["status"] == "dead_lettered"
     assert job["error_code"] == "processing_error"
     assert job["error_message"] == "ValueError"
 
@@ -741,3 +745,368 @@ def test_failed_and_duplicate_jobs_write_no_rows_for_athena(aws_stack):
     _upload_and_process(aws_stack, "all-bad.csv", ALL_INVALID_CSV)  # validation_failed
 
     assert _curated_keys(aws_stack) == [f"curated/sales/month=2024-01/{first_id}.json.gz"]
+
+
+# --- Which objects are inputs ---
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        ("sales.csv", True),
+        ("SALES.CSV", True),
+        ("Q1/Sales.Csv", True),
+        ("sales.csv.gz", True),
+        ("SALES.CSV.GZ", True),
+        ("notes.txt", False),
+        ("sales.csv.bak", False),
+        ("sales.gz", False),
+    ],
+)
+def test_input_keys_are_matched_case_insensitively(key, expected):
+    assert storage.is_input_key(key) is expected
+
+
+def test_uppercase_extension_is_processed(aws_stack):
+    _, job_id = _upload_and_process(aws_stack, "SALES.CSV", VALID_CSV)
+    assert get_job(aws_stack, job_id)["status"] == "completed"
+
+
+def test_non_csv_object_is_ignored_without_a_job_record(aws_stack):
+    result, job_id = _upload_and_process(aws_stack, "notes.txt", b"not a csv")
+    assert result == {"batchItemFailures": []}
+    assert "Item" not in aws_stack["table"].get_item(Key={"job_id": job_id})
+
+
+def test_gzip_upload_is_processed_and_counts_as_the_same_content(aws_stack):
+    _, plain_id = _upload_and_process(aws_stack, "sales.csv", VALID_CSV)
+    _, gz_id = _upload_and_process(aws_stack, "sales.csv.gz", gzip.compress(VALID_CSV))
+
+    gz_job = get_job(aws_stack, gz_id)
+    assert gz_job["status"] == "duplicate_content"
+    assert gz_job["duplicate_of"] == plain_id
+
+
+def test_warning_counts_reach_the_job_record_and_the_notification(aws_stack):
+    body = b"date,product,quantity,unit_price\n2024-01-01,Widget,1,9.99\n2024-01-01,Widget,1,9.99\n"
+    notifier = FakeNotifier()
+    _, job_id = _upload_and_process(aws_stack, "repeats.csv", body, notifier=notifier)
+
+    job = get_job(aws_stack, job_id)
+    assert job["status"] == "completed"
+    assert {k: int(v) for k, v in job["warning_counts"].items()} == {
+        "duplicate_rows": 1,
+        "outliers": 0,
+    }
+    ((_, _, message),) = notifier.calls
+    assert "Warnings: 1 repeated row (row numbers are in summary.json)" in message
+
+
+# --- When retrying stops ---
+
+
+def sqs_record_on_delivery(body: dict, receive_count: int, message_id: str = "m1") -> dict:
+    record = sqs_record(body, message_id)
+    record["attributes"] = {"ApproximateReceiveCount": str(receive_count)}
+    return record
+
+
+def test_transient_error_before_the_last_delivery_stays_retryable(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    flaky = FlakyObjectStorage(storage.S3Storage(aws_stack["s3"]), fail_get=True)
+    event = {
+        "Records": [sqs_record_on_delivery(s3_event(INPUT_BUCKET, "sales.csv", version_id), 4)]
+    }
+
+    result = handler.handle_event(event, make_deps(aws_stack, object_storage=flaky))
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+    job = get_job(aws_stack, jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id))
+    assert job["status"] == "failed"
+
+
+def test_transient_error_on_the_last_delivery_is_dead_lettered_and_redrive_resumes(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    flaky = FlakyObjectStorage(storage.S3Storage(aws_stack["s3"]), fail_get=True)
+    notifier = FakeNotifier()
+    s3_body = s3_event(INPUT_BUCKET, "sales.csv", version_id)
+
+    last = handler.handle_event(
+        {"Records": [sqs_record_on_delivery(s3_body, 5)]},
+        make_deps(aws_stack, notifier=notifier, object_storage=flaky),
+    )
+
+    assert last == {"batchItemFailures": [{"itemIdentifier": "m1"}]}  # SQS moves it to the DLQ
+    job = get_job(aws_stack, job_id)
+    assert job["status"] == "dead_lettered"
+    assert job["error_code"] == "s3_get_object_error"
+    ((_, subject, body),) = notifier.calls
+    assert subject.startswith("CSV job dead_lettered")
+    assert "scripts/redrive_dlq.sh" in body
+
+    # A redrive delivers the message again with a fresh receive count.
+    redriven = handler.handle_event(
+        {"Records": [sqs_record_on_delivery(s3_body, 1)]}, make_deps(aws_stack)
+    )
+    assert redriven == {"batchItemFailures": []}
+    assert get_job(aws_stack, job_id)["status"] == "completed"
+
+
+def test_processing_bug_is_parked_at_once_with_reprocess_instructions(aws_stack, monkeypatch):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    monkeypatch.setattr(handler, "process_csv", lambda *a, **k: 1 / 0)
+    notifier = FakeNotifier()
+
+    result = handler.handle_event(
+        {"Records": [sqs_record_on_delivery(s3_event(INPUT_BUCKET, "sales.csv", version_id), 1)]},
+        make_deps(aws_stack, notifier=notifier),
+    )
+
+    assert result == {"batchItemFailures": []}  # no pointless retries
+    assert get_job(aws_stack, job_id)["status"] == "dead_lettered"
+    ((_, _, body),) = notifier.calls
+    assert f"scripts/reprocess.py --job-id {job_id}" in body
+
+
+@pytest.mark.parametrize("error", [OSError("connection reset"), ConnectionError("eof")])
+def test_network_error_while_reading_is_retried_not_parked(aws_stack, monkeypatch, error):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+
+    def fail_reading(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(handler, "process_csv", fail_reading)
+    result = handler.handle_event(
+        {"Records": [sqs_record_on_delivery(s3_event(INPUT_BUCKET, "sales.csv", version_id), 1)]},
+        make_deps(aws_stack),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+    job = get_job(aws_stack, jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id))
+    assert (job["status"], job["error_code"]) == ("failed", "s3_read_error")
+
+
+def test_waiting_duplicate_is_dead_lettered_on_its_last_delivery(aws_stack):
+    v1 = upload(aws_stack["s3"], "a.csv", VALID_CSV)
+    first_id = jobs.compute_job_id(INPUT_BUCKET, "a.csv", v1)
+    store = jobs.JobStore(aws_stack["table"])
+    store.claim(first_id, INPUT_BUCKET, "a.csv", v1)
+    store.claim_content(hashlib.sha256(VALID_CSV).hexdigest(), first_id)
+
+    v2 = upload(aws_stack["s3"], "b.csv", VALID_CSV)
+    result = handler.handle_event(
+        {"Records": [sqs_record_on_delivery(s3_event(INPUT_BUCKET, "b.csv", v2), 5)]},
+        make_deps(aws_stack, notifier=FakeNotifier()),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+    job = get_job(aws_stack, jobs.compute_job_id(INPUT_BUCKET, "b.csv", v2))
+    assert (job["status"], job["error_code"]) == ("dead_lettered", "waiting_for_original_job")
+
+
+# --- manifest.json: the completion marker ---
+
+
+class RecordingS3Client:
+    def __init__(self, real_client):
+        self._real = real_client
+        self.put_keys: list[str] = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def put_object(self, **kwargs):
+        self.put_keys.append(kwargs["Key"])
+        return self._real.put_object(**kwargs)
+
+
+def test_manifest_is_written_last_and_matches_every_output(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", MIXED_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    recorder = RecordingS3Client(aws_stack["s3"])
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+
+    handler.handle_event(
+        event, make_deps(aws_stack, object_storage=storage.S3Storage(recorder))
+    )
+
+    assert recorder.put_keys[-1] == f"reports/{job_id}/manifest.json"
+    manifest = json.loads(
+        aws_stack["s3"]
+        .get_object(Bucket=OUTPUT_BUCKET, Key=f"reports/{job_id}/manifest.json")["Body"]
+        .read()
+    )
+    assert manifest["job_id"] == job_id
+    assert manifest["status"] == "completed_with_rejections"
+    assert (manifest["schema"], manifest["schema_version"]) == ("sales", 1)
+    assert manifest["content_sha256"] == hashlib.sha256(MIXED_CSV).hexdigest()
+    listed = manifest["files"] + manifest["curated_files"]
+    assert [entry["key"] for entry in listed] == recorder.put_keys[:-1]
+    for entry in listed:
+        body = aws_stack["s3"].get_object(Bucket=OUTPUT_BUCKET, Key=entry["key"])["Body"].read()
+        assert entry == {
+            "key": entry["key"],
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+
+def test_failed_validation_manifest_lists_no_curated_files(aws_stack):
+    _, job_id = _upload_and_process(aws_stack, "bad.csv", ALL_INVALID_CSV)
+    manifest = json.loads(
+        aws_stack["s3"]
+        .get_object(Bucket=OUTPUT_BUCKET, Key=f"reports/{job_id}/manifest.json")["Body"]
+        .read()
+    )
+    assert (manifest["status"], manifest["error_code"]) == ("validation_failed", "no_valid_rows")
+    assert manifest["curated_files"] == []
+
+
+def test_claims_record_the_rules_version_they_ran_with(aws_stack):
+    store = jobs.JobStore(aws_stack["table"], rules=("sales", 3))
+    store.claim("job-1", INPUT_BUCKET, "a.csv", "v1")
+    job = get_job(aws_stack, "job-1")
+    assert (job["schema_name"], int(job["schema_version"])) == ("sales", 3)
+
+    store.mark_failed("job-1", job["lease_owner"], error_code="x", error_message="y")
+    newer = jobs.JobStore(aws_stack["table"], rules=("sales", 4))
+    assert newer.claim("job-1", INPUT_BUCKET, "a.csv", "v1").status is jobs.ClaimStatus.OWNED
+    assert int(get_job(aws_stack, "job-1")["schema_version"]) == 4
+
+
+# --- Metrics (CloudWatch Embedded Metric Format) ---
+
+
+def _metric_lines(capsys):
+    lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    return [ln for ln in lines if ln.get("message") == "job_attempt_metrics"]
+
+
+def test_each_attempt_emits_one_metrics_line_with_its_outcome(aws_stack, capsys):
+    _, job_id = _upload_and_process(aws_stack, "sales.csv", MIXED_CSV)
+
+    (line,) = _metric_lines(capsys)
+    assert line["job_id"] == job_id
+    assert line["Status"] == "completed_with_rejections"
+    assert (line["JobAttempts"], line["ValidRows"], line["RejectedRows"]) == (1, 1, 1)
+    assert isinstance(line["ProcessingMs"], int)
+    (directive,) = line["_aws"]["CloudWatchMetrics"]
+    assert directive["Namespace"] == "CsvSalesPipeline"
+    assert directive["Dimensions"] == [["Status"]]
+    assert {m["Name"] for m in directive["Metrics"]} == {
+        "JobAttempts",
+        "ValidRows",
+        "RejectedRows",
+        "ProcessingMs",
+    }
+
+
+def test_failed_and_duplicate_attempts_are_counted_by_status(aws_stack, capsys):
+    version_id = upload(aws_stack["s3"], "a.csv", VALID_CSV)
+    flaky = FlakyObjectStorage(storage.S3Storage(aws_stack["s3"]), fail_get=True)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "a.csv", version_id))]}
+    handler.handle_event(event, make_deps(aws_stack, object_storage=flaky))
+    handler.handle_event(event, make_deps(aws_stack, notifier=FakeNotifier()))
+    _upload_and_process(aws_stack, "copy.csv", VALID_CSV)
+
+    assert [line["Status"] for line in _metric_lines(capsys)] == [
+        "failed",
+        "completed",
+        "duplicate_content",
+    ]
+
+
+def test_no_metrics_when_another_worker_has_taken_over(aws_stack, capsys):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+
+    def steal():
+        expire_lease(aws_stack, job_id)
+        jobs.JobStore(aws_stack["table"]).claim(job_id, INPUT_BUCKET, "sales.csv", version_id)
+
+    slow = HookedPutStorage(storage.S3Storage(aws_stack["s3"]), before_put=steal)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+    handler.handle_event(event, make_deps(aws_stack, object_storage=slow))
+
+    assert _metric_lines(capsys) == []
+
+
+# --- EventBridge events ---
+
+
+class FakeEvents:
+    def __init__(self, fail_times: int = 0):
+        self.events: list[tuple[str, dict]] = []
+        self._fail_times = fail_times
+
+    def publish(self, *, detail_type, detail):
+        self.events.append((detail_type, detail))
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            raise RuntimeError("simulated EventBridge failure")
+
+
+def test_finished_job_publishes_an_event_with_its_source_file(aws_stack):
+    version_id = upload(aws_stack["s3"], "q1/sales.csv", MIXED_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "q1/sales.csv", version_id)
+    deps = make_deps(aws_stack, notifier=FakeNotifier())
+    deps.events = FakeEvents()
+
+    handler.handle_event(
+        {"Records": [sqs_record(s3_event(INPUT_BUCKET, "q1/sales.csv", version_id))]}, deps
+    )
+
+    ((detail_type, detail),) = deps.events.events
+    assert detail_type == "CSV job finished"
+    assert detail == {
+        "job_id": job_id,
+        "status": "completed_with_rejections",
+        "valid_row_count": 1,
+        "rejected_row_count": 1,
+        "error_code": None,
+        "duplicate_of": None,
+        "warning_counts": {"duplicate_rows": 0, "outliers": 0},
+        "output_bucket": OUTPUT_BUCKET,
+        "summary_key": f"reports/{job_id}/summary.json",
+        "rejected_key": f"reports/{job_id}/rejected_rows.csv",
+        "source_bucket": INPUT_BUCKET,
+        "source_key": "q1/sales.csv",
+        "source_version_id": version_id,
+    }
+
+
+def test_event_failure_is_retried_with_the_notification(aws_stack):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    job_id = jobs.compute_job_id(INPUT_BUCKET, "sales.csv", version_id)
+    event = {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}
+    deps = make_deps(aws_stack, notifier=FakeNotifier())
+    deps.events = FakeEvents(fail_times=1)
+
+    assert handler.handle_event(event, deps) == {"batchItemFailures": [{"itemIdentifier": "m1"}]}
+    assert get_job(aws_stack, job_id)["notification_status"] == "failed"
+    assert handler.handle_event(event, deps) == {"batchItemFailures": []}
+    assert [d["status"] for _, d in deps.events.events] == ["completed", "completed"]
+    assert get_job(aws_stack, job_id)["notification_status"] == "sent"
+
+
+def test_dead_lettered_job_publishes_an_event(aws_stack, monkeypatch):
+    version_id = upload(aws_stack["s3"], "sales.csv", VALID_CSV)
+    monkeypatch.setattr(handler, "process_csv", lambda *a, **k: 1 / 0)
+    deps = make_deps(aws_stack, notifier=FakeNotifier())
+    deps.events = FakeEvents()
+
+    handler.handle_event(
+        {"Records": [sqs_record(s3_event(INPUT_BUCKET, "sales.csv", version_id))]}, deps
+    )
+
+    ((detail_type, detail),) = deps.events.events
+    assert detail_type == "CSV job dead-lettered"
+    assert (detail["error_code"], detail["in_dead_letter_queue"]) == ("processing_error", False)
+
+
+def test_event_publisher_sends_to_eventbridge(aws_stack):
+    events_client = boto3.client("events", region_name=REGION)
+    publisher = notifications.EventPublisher(events_client, "default", "csv-sales-pipeline")
+    publisher.publish(detail_type="CSV job finished", detail={"job_id": "x", "status": "completed"})

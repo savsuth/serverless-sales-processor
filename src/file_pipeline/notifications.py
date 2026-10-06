@@ -17,7 +17,10 @@ notification retries are gated on the job already being terminal.
 
 from __future__ import annotations
 
+import json
 from typing import Any
+
+_WARNING_LABELS = {"duplicate_rows": "repeated row", "outliers": "unusual value"}
 
 
 def build_notification_message(
@@ -32,6 +35,10 @@ def build_notification_message(
     error_code: str | None,
     error_message: str | None,
     duplicate_of: str | None = None,
+    warning_counts: dict[str, int] | None = None,
+    next_step: str | None = None,
+    download_links: dict[str, str] | None = None,
+    links_expire_at: str | None = None,
 ) -> tuple[str, str]:
     """Returns (subject, body). Reports are private S3 objects (no public
     access) -- the notification names their bucket/key so an authorized
@@ -44,6 +51,18 @@ def build_notification_message(
     if valid_row_count is not None and rejected_row_count is not None:
         lines.append(f"Valid rows: {valid_row_count}")
         lines.append(f"Rejected rows: {rejected_row_count}")
+
+    flagged = {name: int(count) for name, count in (warning_counts or {}).items() if count}
+    if flagged:
+        parts = [
+            f"{count} {_WARNING_LABELS.get(name, name)}{'' if count == 1 else 's'}"
+            for name, count in flagged.items()
+        ]
+        lines.append(f"Warnings: {', '.join(parts)} (row numbers are in summary.json)")
+
+    if download_links:
+        lines.append(f"Download links (valid until {links_expire_at}):")
+        lines.extend(f"  {name}: {url}" for name, url in download_links.items())
 
     if output_summary_key and output_rejected_key and output_bucket:
         lines.append(f"Summary report: s3://{output_bucket}/{output_summary_key}")
@@ -60,6 +79,8 @@ def build_notification_message(
         lines.append(f"Error code: {error_code}")
     if error_message:
         lines.append(f"Error: {error_message}")
+    if next_step:
+        lines.append(f"Next step: {next_step}")
 
     return subject, "\n".join(lines)
 
@@ -79,3 +100,30 @@ class SNSNotifier:
                 "job_id": {"DataType": "String", "StringValue": job_id},
             },
         )
+
+
+class EventPublisher:
+    """Publishes job outcomes to an EventBridge bus, so other systems can
+    subscribe to exactly the outcomes they care about (for example only
+    validation_failed) with an EventBridge rule. Delivery is at least once,
+    like the SNS notification it accompanies."""
+
+    def __init__(self, events_client: Any, bus_name: str, source: str) -> None:
+        self._events = events_client
+        self._bus_name = bus_name
+        self._source = source
+
+    def publish(self, *, detail_type: str, detail: dict[str, Any]) -> None:
+        response = self._events.put_events(
+            Entries=[
+                {
+                    "EventBusName": self._bus_name,
+                    "Source": self._source,
+                    "DetailType": detail_type,
+                    "Detail": json.dumps(detail),
+                }
+            ]
+        )
+        if response.get("FailedEntryCount"):
+            code = response["Entries"][0].get("ErrorCode", "Unknown")
+            raise RuntimeError(f"EventBridge rejected the event: {code}")

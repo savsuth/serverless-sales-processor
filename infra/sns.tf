@@ -1,5 +1,6 @@
 resource "aws_sns_topic" "notifications" {
-  name = "${var.project_name}-notifications"
+  name              = "${var.project_name}-notifications"
+  kms_master_key_id = local.kms_key_arn
 }
 
 # AWS requires the recipient to confirm this subscription (a confirmation

@@ -34,7 +34,7 @@ variable "github_repository" {
 }
 
 variable "github_environment" {
-  description = "GitHub Environment whose jobs may assume the deploy role. Configure required reviewers and a deployment-branch rule (main only) on that Environment: GitHub puts the environment, not the branch, in the OIDC subject claim for jobs that use one."
+  description = "GitHub Environment whose jobs may assume the deploy role. Configure required reviewers and a deployment-branch rule (master only) on that Environment: GitHub puts the environment, not the branch, in the OIDC subject claim for jobs that use one."
   type        = string
   default     = "production"
 }
@@ -43,4 +43,10 @@ variable "existing_github_oidc_provider_arn" {
   description = "An account can have only one OIDC provider per issuer URL. If token.actions.githubusercontent.com is already registered, set its ARN here and it will be reused instead of created."
   type        = string
   default     = ""
+}
+
+variable "project_tag" {
+  description = "Value of the Project tag the application stack's provider applies to every resource (infra/providers.tf); KMS permissions for the deploy role are scoped to keys carrying it."
+  type        = string
+  default     = "csv-sales-pipeline"
 }

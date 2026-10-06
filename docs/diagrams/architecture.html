@@ -54,7 +54,7 @@
     <h1>Event-driven CSV processing on AWS</h1>
     <svg viewBox="0 0 1100 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="architecture-title architecture-desc">
       <title id="architecture-title">CSV sales pipeline AWS architecture</title>
-      <desc id="architecture-desc">Architecture diagram showing an uploaded sales CSV moving from an S3 input bucket through an SQS queue to a Lambda processor, which claims the job and checks for duplicate content in DynamoDB, writes reports and curated rows to an S3 output bucket that Athena queries by month, and publishes a completion notice to SNS, with a dead-letter queue and CloudWatch alarms handling failures.</desc>
+      <desc id="architecture-desc">Architecture diagram showing an uploaded sales CSV moving from an S3 input bucket through an SQS queue to a Lambda processor, which claims the job and checks for duplicate content in DynamoDB, writes reports and curated rows to an S3 output bucket that Athena queries by month, and announces each outcome by SNS email and an EventBridge event, with a dead-letter queue, CloudWatch alarms and a dashboard covering failures.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
@@ -187,9 +187,9 @@
       <rect x="744" y="296" width="144" height="80" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
       <rect x="752" y="304" width="30" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
       <text x="767" y="313" fill="#2d3142" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SNS</text>
-      <text x="816" y="336" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Notifications</text>
-      <text x="816" y="352" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">job id · outcome</text>
-      <text x="816" y="366" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">email subscribers</text>
+      <text x="816" y="336" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Job outcomes</text>
+      <text x="816" y="352" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">SNS email + links</text>
+      <text x="816" y="366" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">EventBridge events</text>
 
       <!-- DLQ (optional/async) -->
       <rect x="272" y="328" width="144" height="80" rx="6" fill="#f5f5f5"/>
@@ -205,8 +205,8 @@
       <rect x="56" y="328" width="144" height="80" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
       <rect x="64" y="336" width="24" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
       <text x="76" y="345" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CW</text>
-      <text x="128" y="368" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Alarms</text>
-      <text x="128" y="384" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">errors · DLQ depth</text>
+      <text x="128" y="368" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Alarms + dashboard</text>
+      <text x="128" y="384" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">errors · DLQ · stuck</text>
       <text x="128" y="398" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">-&gt; SNS topic</text>
 
       <!-- Athena -->
@@ -241,9 +241,9 @@
       <text x="792" y="500" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Async / on-failure</text>
 
       <!-- ============ Footnote cards ============ -->
-      <text x="32" y="531" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">IAM: role scoped to project resources and relevant prefixes</text>
-      <text x="32" y="548" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">Job identity: sha256(bucket, key, versionId); same file content detected by sha256 of its bytes</text>
-      <text x="32" y="565" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">Outputs: reports/{job_id}/summary.json + rejected_rows.csv; curated/sales/month=YYYY-MM/{job_id}.json.gz</text>
+      <text x="32" y="531" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">Security: roles scoped to project resources; all data at rest under the project KMS key</text>
+      <text x="32" y="548" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">Identity: job = sha256(bucket, key, versionId); duplicate content = sha256 of the file's bytes</text>
+      <text x="32" y="565" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">Outputs: reports/{job_id}/ (summary, rejected rows, manifest last); curated/sales/month=YYYY-MM/</text>
     </svg>
   </div>
 </body>

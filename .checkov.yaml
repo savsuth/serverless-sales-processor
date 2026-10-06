@@ -1,0 +1,35 @@
+# checkov settings for the Terraform in infra/ (run in CI; see
+# .github/workflows/ci.yml). Every skipped check is a deliberate decision,
+# with the reason beside it. Checks skipped for one resource only are
+# marked inline in the .tf files with "checkov:skip" comments.
+framework:
+  - terraform
+compact: true
+quiet: true
+skip-check:
+  # Lambda inside a VPC: nothing here needs private network access, and a
+  # VPC would add NAT gateway or interface endpoint costs for no gain.
+  - CKV_AWS_117
+  # Reserved concurrency on the processor would throttle SQS deliveries
+  # into the dead-letter queue (docs/decisions/0002); the portal is rate
+  # limited by API Gateway instead.
+  - CKV_AWS_115
+  # A Lambda dead-letter queue applies to asynchronous invocations only:
+  # the processor is SQS-triggered (the queue has its own DLQ) and the
+  # portal is invoked synchronously by API Gateway.
+  - CKV_AWS_116
+  # Code signing needs an AWS Signer profile and a signing step; deploys
+  # are made by one person from a reviewed branch.
+  - CKV_AWS_272
+  # Cross-region replication: the organization's SCP allows workloads in
+  # us-east-2 only.
+  - CKV_AWS_144
+  # S3 server access logs: private, low-volume buckets; enable (with a log
+  # bucket) if per-request audit trails are ever required.
+  - CKV_AWS_18
+  # Event notifications on buckets other than the input bucket would have
+  # no consumer.
+  - CKV2_AWS_62
+  # One-year log retention: retention is a variable (log_retention_days,
+  # default 30) to keep costs down; raise it if logs must be kept longer.
+  - CKV_AWS_338

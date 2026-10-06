@@ -4,6 +4,12 @@ variable "project_name" {
   default     = "csv-sales-pipeline"
 }
 
+variable "environment" {
+  description = "Environment name, applied as the Environment tag on every resource (cost reports can split by it). See infra/envs/README.md."
+  type        = string
+  default     = "prod"
+}
+
 variable "aws_region" {
   description = "Region for every resource. The S3 bucket and its SQS notification queue must share a region, so this is the single region for the whole stack. Defaults to us-east-2: this AWS account has an organization-level Service Control Policy (AdvancedModeRegionRestrictionSecurityControlPolicy) that funnels general workloads to us-east-2 and denies most S3/EC2/DynamoDB/Lambda actions in us-east-1 and us-west-2. Override only if your account doesn't have that restriction."
   type        = string
@@ -54,21 +60,21 @@ variable "athena_month_range" {
 }
 
 # --- Lambda sizing ---------------------------------------------------------
-# Conservative defaults for a CSV up to 10 MiB. Revenue/quantity aggregation
-# scales with distinct product count (held in memory), not row count, and
-# rows themselves are streamed -- so memory needs are modest even for a
-# file with a lot of rows, as long as the product cardinality stays sane.
+# Sized from measurements on the deployed stack (docs/costs.md). Processing
+# is CPU-bound and costs about 0.12 ms per row at 512 MB; the worst case
+# is a 10 MiB file of the shortest valid rows (about 617,000 rows). Lambda
+# gives CPU in proportion to memory, so memory is the lever for time.
 
 variable "lambda_timeout_seconds" {
-  description = "Lambda function timeout. 60s comfortably covers parsing/aggregating a 10 MiB CSV plus S3/DynamoDB/SNS round trips with margin."
+  description = "Lambda function timeout. At the default 1024 MB the worst-case 10 MiB file took 34.3 s (docs/costs.md), leaving headroom. Must stay below job_lease_seconds."
   type        = number
   default     = 60
 }
 
 variable "lambda_memory_mb" {
-  description = "Lambda memory. 512 MB gives headroom for Decimal-heavy aggregation and CPython overhead without over-provisioning for a bounded 10 MiB input."
+  description = "Lambda memory, which also sets its CPU share. 1024 MB keeps the worst-case 10 MiB file (about 617,000 short rows) well inside the 60 s timeout; at 512 MB it would need about 67 s. Peak memory measured for a 10 MB file is about 210 MB, so the setting is about CPU, not memory. Cost per file barely changes, because CPU-bound work finishes proportionally faster."
   type        = number
-  default     = 512
+  default     = 1024
 }
 
 variable "lambda_max_concurrency" {
@@ -120,10 +126,44 @@ variable "log_retention_days" {
 
 # --- Notifications -----------------------------------------------------
 
+variable "enable_events" {
+  description = "Publish a \"CSV job finished\" / \"CSV job dead-lettered\" event to the account's default EventBridge bus for every job outcome, so other systems can subscribe with an EventBridge rule (source = project_name)."
+  type        = bool
+  default     = true
+}
+
 variable "notification_email" {
   description = "Optional email address to subscribe to the SNS notification topic (job completion + alarms). Leave empty to create the topic without a subscription and add one later. AWS requires the recipient to confirm the subscription (a confirmation email is sent) before delivery starts."
   type        = string
   default     = ""
+}
+
+# --- Encryption -----------------------------------------------------------
+
+variable "enable_kms" {
+  description = "Encrypt data at rest with a customer-managed KMS key (infra/kms.tf) instead of AWS-managed keys. About 1 USD per month plus requests (S3 bucket keys keep request counts low)."
+  type        = bool
+  default     = true
+}
+
+# --- Portal: upload page and report links -----------------------------
+
+variable "enable_portal" {
+  description = "Create the token-protected portal API used by tools/upload.html and by the download links in notification emails."
+  type        = bool
+  default     = true
+}
+
+variable "report_link_days" {
+  description = "How long the download links in notification emails stay valid."
+  type        = number
+  default     = 7
+}
+
+variable "portal_requests_per_second" {
+  description = "API Gateway steady-state request limit for the portal (burst is twice this)."
+  type        = number
+  default     = 10
 }
 
 # --- Budget alert (optional) -------------------------------------------

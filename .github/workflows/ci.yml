@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   python:
-    name: Ruff + pytest
+    name: Ruff + mypy + pytest + audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,14 +19,50 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Lets tests/test_terraform_schema.py run instead of skipping. The
+      # wrapper is off so `terraform console` output stays plain.
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
       - name: Ruff
         run: ruff check src tests
 
-      - name: pytest
-        run: pytest tests/ -v
+      - name: mypy
+        run: mypy
+
+      # Fails below the coverage floor in pyproject.toml
+      # ([tool.coverage.report] fail_under).
+      - name: pytest with coverage
+        run: |
+          pytest tests/ --cov --cov-report=term-missing --cov-report=markdown:coverage.md
+          cat coverage.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Known vulnerabilities in the installed dependencies. The project
+      # itself is installed editable and is not on PyPI, so it is skipped.
+      - name: pip-audit
+        run: pip-audit --skip-editable
+
+  terraform-security:
+    name: Terraform security scan (checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Skipped checks and their reasons are in .checkov.yaml and in
+      # inline checkov:skip comments.
+      - name: checkov
+        run: |
+          pip install checkov
+          checkov --config-file .checkov.yaml --directory infra
 
   terraform:
     name: Terraform fmt + validate (${{ matrix.dir }})

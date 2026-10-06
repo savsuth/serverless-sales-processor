@@ -61,7 +61,13 @@ def _padded(value: st.SearchStrategy[str]) -> st.SearchStrategy[str]:
 @st.composite
 def valid_rows(draw) -> Row:
     date = draw(st.dates()).isoformat()
-    product = draw(st.text(_text, min_size=1, max_size=12).filter(lambda s: s.strip()))
+    # Some names differ only in letter case: the sales schema groups them.
+    product = draw(
+        st.one_of(
+            st.sampled_from(["Widget", "widget", " WIDGET ", "Gadget", "gadget"]),
+            st.text(_text, min_size=1, max_size=12).filter(lambda s: s.strip()),
+        )
+    )
     quantity = draw(st.integers(min_value=1, max_value=10**6))
     leading_zeros = "0" * draw(st.integers(min_value=0, max_value=2))
     cents = draw(st.integers(min_value=0, max_value=10**9))
@@ -145,20 +151,25 @@ def _expected_status(valid_count: int, rejected_count: int) -> str:
 def _expected_summary(rows: list[Row]) -> dict:
     valid = [r for r in rows if r is not BLANK and r.reason is None]
     rejected = [r for r in rows if r is not BLANK and r.reason is not None]
+    # Product names are compared case-insensitively and reported under the
+    # alphabetically first spelling.
     totals: dict[str, tuple[int, Decimal]] = {}
+    names: dict[str, str] = {}
     total_revenue = Decimal("0")
     for row in valid:
         revenue = row.quantity * row.unit_price
-        quantity_so_far, revenue_so_far = totals.get(row.product, (0, Decimal("0")))
-        totals[row.product] = (quantity_so_far + row.quantity, revenue_so_far + revenue)
+        key = row.product.lower()
+        names[key] = min(names.get(key, row.product), row.product)
+        quantity_so_far, revenue_so_far = totals.get(key, (0, Decimal("0")))
+        totals[key] = (quantity_so_far + row.quantity, revenue_so_far + revenue)
         total_revenue += revenue
     return {
         "total_revenue": format(total_revenue, "f"),
         "valid_row_count": len(valid),
         "rejected_row_count": len(rejected),
         "by_product": {
-            product: {"quantity": quantity, "revenue": format(revenue, "f")}
-            for product, (quantity, revenue) in totals.items()
+            names[key]: {"quantity": quantity, "revenue": format(revenue, "f")}
+            for key, (quantity, revenue) in totals.items()
         },
     }
 
@@ -170,13 +181,17 @@ def _sanitized(value: str) -> str:
 # --- Properties ------------------------------------------------------------
 
 
+def _without_warnings(summary: dict) -> dict:
+    return {k: v for k, v in summary.items() if k != "warnings"}
+
+
 @settings(max_examples=300, deadline=None)
 @given(sales_files)
 def test_totals_match_an_independent_calculation(rows):
     result, _ = _process(rows)
     expected = _expected_summary(rows)
 
-    assert build_summary_dict(result) == expected
+    assert _without_warnings(build_summary_dict(result)) == expected
     assert result.status == _expected_status(
         expected["valid_row_count"], expected["rejected_row_count"]
     )
@@ -210,7 +225,14 @@ def test_row_order_does_not_change_the_summary(rows, data):
     original, _ = _process(rows)
     reordered, _ = _process(shuffled)
 
-    assert summary_json_bytes(reordered) == summary_json_bytes(original)
+    # Warnings name row numbers, which do move with the rows; their counts
+    # must not.
+    assert _without_warnings(build_summary_dict(reordered)) == _without_warnings(
+        build_summary_dict(original)
+    )
+    assert {k: w["count"] for k, w in reordered.warnings.items()} == {
+        k: w["count"] for k, w in original.warnings.items()
+    }
 
 
 @settings(max_examples=300, deadline=None)
@@ -304,3 +326,67 @@ def test_curated_rows_add_up_to_the_summary(rows):
     assert sum((row["revenue"] for _, row in curated_rows), Decimal("0")) == result.total_revenue
     for key, row in curated_rows:
         assert f"/month={row['date'][:7]}/" in key
+
+
+def _to_csv_bytes_with(rows: list[Row], delimiter: str) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, delimiter=delimiter)
+    writer.writerow(HEADER)
+    for row in rows:
+        if row is BLANK:
+            buffer.write("\r\n")
+        else:
+            writer.writerow(row.fields)
+    return buffer.getvalue().encode("utf-8")
+
+
+@settings(max_examples=200, deadline=None)
+@given(sales_files, st.sampled_from([";", "\t"]))
+def test_the_field_separator_does_not_change_the_result(rows, delimiter):
+    comma = process_csv(io.BytesIO(_to_csv_bytes(rows)), io.StringIO())
+    other = process_csv(io.BytesIO(_to_csv_bytes_with(rows, delimiter)), io.StringIO())
+
+    assert summary_json_bytes(other) == summary_json_bytes(comma)
+    assert other.status == comma.status
+
+
+@settings(max_examples=200, deadline=None)
+@given(sales_files)
+def test_grouping_curated_rows_like_the_athena_queries_reproduces_the_report(rows):
+    """The saved queries use GROUP BY lower(product) with min(product)."""
+    with CuratedWriter(load_schema(), "job") as writer:
+        result = process_csv(
+            io.BytesIO(_to_csv_bytes(rows)), io.StringIO(), on_valid_row=writer.add
+        )
+        curated_rows = [row for _, body in writer.files() for row in read_curated_file(body)]
+
+    groups: dict[str, list] = {}
+    for row in curated_rows:
+        name, quantity, revenue = groups.get(row["product"].lower(), [row["product"], 0, 0])
+        groups[row["product"].lower()] = [
+            min(name, row["product"]),
+            quantity + row["quantity"],
+            revenue + row["revenue"],
+        ]
+    by_product = {
+        name: {"quantity": quantity, "revenue": format(Decimal(revenue), "f")}
+        for name, quantity, revenue in groups.values()
+    }
+    assert by_product == build_summary_dict(result)["by_product"]
+
+
+@settings(max_examples=200, deadline=None)
+@given(sales_files)
+def test_repeated_row_count_equals_valid_rows_minus_distinct_rows(rows):
+    result, _ = _process(rows)
+    distinct = {
+        (
+            r.fields[0].strip(),
+            r.product.lower(),
+            r.quantity,
+            r.unit_price.normalize(),
+        )
+        for r in rows
+        if r is not BLANK and r.reason is None
+    }
+    assert result.warnings["duplicate_rows"]["count"] == result.valid_row_count - len(distinct)

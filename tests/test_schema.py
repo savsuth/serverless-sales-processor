@@ -238,3 +238,64 @@ def test_measure_cannot_reuse_a_column_name_for_a_different_calculation():
 def test_schema_name_must_be_a_plain_identifier(name):
     with pytest.raises(SchemaError):
         parse_schema({**INVENTORY_SCHEMA, "name": name})
+
+
+def test_bundled_sales_schema_accepts_comma_semicolon_and_tab():
+    assert load_schema().delimiters == (",", ";", "\t")
+
+
+def test_delimiters_default_to_comma():
+    assert parse_schema(INVENTORY_SCHEMA).delimiters == (",",)
+
+
+@pytest.mark.parametrize("delimiters", [[], [",,"], ["a"], ['"'], [",", ","], "abc", [" "]])
+def test_invalid_delimiters_are_rejected(delimiters):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "delimiters": delimiters})
+
+
+def test_bundled_sales_schema_warns_about_repeats_and_price_outliers():
+    schema = load_schema()
+    assert schema.warn_duplicate_rows is True
+    assert (schema.outliers.column, schema.outliers.per, schema.outliers.factor) == (
+        "unit_price",
+        "product",
+        Decimal("10"),
+    )
+
+
+@pytest.mark.parametrize(
+    "warnings",
+    [
+        {"duplicate_rows": "yes"},
+        {"outliers": {"column": "sku", "per": "counted_on", "factor": 10}},
+        {"outliers": {"column": "units", "per": "unit_cost", "factor": 10}},
+        {"outliers": {"column": "units", "per": "sku", "factor": 1}},
+        {"outliers": {"column": "units", "per": "sku", "factor": True}},
+        {"outliers": {"column": "units", "per": "sku"}},
+        {"unknown": True},
+    ],
+    ids=[
+        "duplicate_rows_not_boolean",
+        "outlier_column_not_numeric",
+        "outlier_per_not_groupable",
+        "factor_not_above_one",
+        "factor_boolean",
+        "factor_missing",
+        "unknown_key",
+    ],
+)
+def test_invalid_warnings_are_rejected(warnings):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "warnings": warnings})
+
+
+def test_schema_version_defaults_to_one():
+    assert parse_schema(INVENTORY_SCHEMA).version == 1
+    assert load_schema().version == 1
+
+
+@pytest.mark.parametrize("version", [0, -1, 1.5, "2", True])
+def test_invalid_schema_versions_are_rejected(version):
+    with pytest.raises(SchemaError):
+        parse_schema({**INVENTORY_SCHEMA, "version": version})

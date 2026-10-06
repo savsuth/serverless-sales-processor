@@ -31,7 +31,12 @@ Column types and their options:
 
 * `date`: `YYYY-MM-DD`, a real calendar date. Rejection: `invalid_<name>`.
 * `string`: any text, trimmed. `required` rejects an empty value
-  (`empty_<name>`).
+  (`empty_<name>`). `case_insensitive` treats values that differ only
+  in letter case as the same value when grouping and when spotting
+  duplicate rows. Reports show the alphabetically first spelling, so row
+  order never changes a report; curated rows keep each row's own
+  spelling, and `GROUP BY lower(col)` with `min(col)` in Athena gives the
+  same grouping.
 * `integer`: digits only, no sign unless `signed`. `positive` rejects
   zero and below (`non_positive_<name>`). Otherwise `invalid_<name>`.
 * `decimal`: plain decimal notation, no exponent. `NaN`/`Infinity`
@@ -48,6 +53,31 @@ column; `total: true` also reports a grand total as `total_<name>`.
 rejected rows is strictly above it, even though some rows were valid:
 its reports are still written, but its status is `validation_failed`.
 Omit it to accept any share of rejected rows.
+
+`version` (optional, default 1) numbers the rules. Bump it when a rule
+changes; each job records the schema name and version it was processed
+with, and `scripts/reprocess.py --older-than-version N` re-runs jobs
+processed under older rules.
+
+`delimiters` (optional, default `[","]`) lists the field separators a
+file may use, in order of preference; the first one that splits the
+header into all the required columns is used, so semicolon- or
+tab-separated exports work without any setting per file.
+
+`warnings` (optional) flags suspicious valid rows without rejecting
+them or changing any total; the report lists how many and which rows:
+
+    "warnings": {
+      "duplicate_rows": true,
+      "outliers": {"column": "unit_price", "per": "product", "factor": 10}
+    }
+
+`duplicate_rows` flags a row whose values all equal an earlier valid
+row's (numbers compared by value, case-insensitive columns ignoring
+case). `outliers` flags a row whose `column` value is more than `factor`
+times above or below the median of that column for the same `per` value
+in the file (e.g. 999.00 where a product usually costs 9.99); groups with
+fewer than 3 rows, or a median of zero, are not checked.
 
 `curated` (optional) makes the Lambda also write every valid row of a
 completed job as queryable data for Athena, one file per calendar month
@@ -75,7 +105,7 @@ DEFAULT_SCHEMA = "sales"
 
 COLUMN_OPTIONS = {
     "date": frozenset(),
-    "string": frozenset({"required"}),
+    "string": frozenset({"required", "case_insensitive"}),
     "integer": frozenset({"positive", "signed"}),
     "decimal": frozenset({"non_negative"}),
 }
@@ -96,6 +126,7 @@ class Column:
     name: str
     type: str
     required: bool = False
+    case_insensitive: bool = False
     positive: bool = False
     signed: bool = False
     non_negative: bool = False
@@ -110,17 +141,31 @@ class Measure:
 
 
 @dataclass(frozen=True)
+class OutlierRule:
+    column: str
+    per: str
+    factor: Decimal
+
+
+@dataclass(frozen=True)
 class Schema:
     name: str
     columns: tuple[Column, ...]
     group_by: str
     measures: tuple[Measure, ...]
     max_rejection_rate: Decimal | None = None
+    version: int = 1
     curated_partition_column: str | None = None
+    delimiters: tuple[str, ...] = (",",)
+    warn_duplicate_rows: bool = False
+    outliers: OutlierRule | None = None
 
     @property
     def column_names(self) -> tuple[str, ...]:
         return tuple(c.name for c in self.columns)
+
+    def column(self, name: str) -> Column:
+        return next(c for c in self.columns if c.name == name)
 
 
 def load_schema(name_or_path: str = DEFAULT_SCHEMA) -> Schema:
@@ -145,7 +190,7 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         data,
         "schema",
         required={"name", "columns", "aggregation"},
-        optional={"max_rejection_rate", "curated"},
+        optional={"max_rejection_rate", "curated", "delimiters", "warnings", "version"},
     )
     name = data["name"]
     if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
@@ -184,8 +229,54 @@ def parse_schema(data: dict[str, Any]) -> Schema:
         group_by=group_by,
         measures=measures,
         max_rejection_rate=_parse_rate(data.get("max_rejection_rate")),
+        version=_parse_version(data.get("version", 1)),
         curated_partition_column=_parse_curated(data.get("curated"), by_name, measures),
+        delimiters=_parse_delimiters(data.get("delimiters", [","])),
+        **_parse_warnings(data.get("warnings"), by_name),
     )
+
+
+def _parse_warnings(value: Any, columns: dict[str, Column]) -> dict[str, Any]:
+    if value is None:
+        return {}
+    _require_keys(value, "warnings", required=set(), optional={"duplicate_rows", "outliers"})
+    duplicate_rows = value.get("duplicate_rows", False)
+    if not isinstance(duplicate_rows, bool):
+        raise SchemaError("warnings.duplicate_rows must be true or false")
+
+    outliers = None
+    if "outliers" in value:
+        rule = value["outliers"]
+        _require_keys(rule, "warnings.outliers", required={"column", "per", "factor"})
+        column = columns.get(rule["column"])
+        if column is None or column.type not in NUMERIC_TYPES:
+            raise SchemaError(f"warnings.outliers column must be numeric: {rule['column']!r}")
+        per = columns.get(rule["per"])
+        if per is None or per.type not in GROUPABLE_TYPES:
+            raise SchemaError(
+                f"warnings.outliers per must be a date or string column: {rule['per']!r}"
+            )
+        factor = rule["factor"]
+        if isinstance(factor, bool) or not isinstance(factor, int | float) or factor <= 1:
+            raise SchemaError(f"warnings.outliers factor must be a number above 1: {factor!r}")
+        outliers = OutlierRule(column=column.name, per=per.name, factor=Decimal(str(factor)))
+    return {"warn_duplicate_rows": duplicate_rows, "outliers": outliers}
+
+
+def _parse_version(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SchemaError(f"version must be a whole number from 1 up: {value!r}")
+    return value
+
+
+def _parse_delimiters(value: Any) -> tuple[str, ...]:
+    delimiters = tuple(_non_empty_list(value, "delimiters"))
+    for d in delimiters:
+        if not isinstance(d, str) or len(d) != 1 or d.isalnum() or d in "\"\r\n ":
+            raise SchemaError(f"each delimiter must be one punctuation or tab character: {d!r}")
+    if len(set(delimiters)) != len(delimiters):
+        raise SchemaError("delimiters must be unique")
+    return delimiters
 
 
 def _parse_curated(

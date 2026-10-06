@@ -21,8 +21,16 @@ to one processing attempt) with a `lease_expires_at` (epoch seconds).
     expired                   -> conditional steal keyed on the expiry
                                   check staying true (owned, or LOST_RACE
                                   if another worker stole it first)
-  * status=failed              -> conditional reclaim keyed on status
-                                  staying "failed" (owned, or LOST_RACE)
+  * status=failed or
+    dead_lettered              -> conditional reclaim keyed on status
+                                  staying the same (owned, or LOST_RACE)
+
+`failed` means an attempt did not finish and SQS will deliver the
+message again. `dead_lettered` means retrying stopped: either the last
+allowed delivery failed (the message is now in the dead-letter queue and
+a redrive resumes it), or processing hit an error that would recur on
+every attempt (the message was acknowledged; scripts/reprocess.py
+resumes it after a fix). Neither is final, so both can be reclaimed.
 
 Every state-changing write after the initial claim is itself conditioned
 on `lease_owner == <our token>`, so a worker whose lease has since been
@@ -67,6 +75,9 @@ STATUS_COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
 STATUS_VALIDATION_FAILED = "validation_failed"
 STATUS_DUPLICATE_CONTENT = "duplicate_content"
 STATUS_FAILED = "failed"
+STATUS_DEAD_LETTERED = "dead_lettered"
+
+RECLAIMABLE_STATUSES = frozenset({STATUS_FAILED, STATUS_DEAD_LETTERED})
 
 TERMINAL_STATUSES = frozenset(
     {
@@ -142,9 +153,17 @@ def _is_conditional_check_failed(exc: ClientError) -> bool:
 
 
 class JobStore:
-    def __init__(self, table: Any, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> None:
+    def __init__(
+        self,
+        table: Any,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        rules: tuple[str, int] | None = None,
+    ) -> None:
+        """`rules` (schema name, version) is recorded on every claim, so a
+        job shows which rules its latest attempt ran with."""
         self._table = table
         self._lease_seconds = lease_seconds
+        self._rules = rules
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         response = self._table.get_item(Key={"job_id": job_id}, ConsistentRead=True)
@@ -153,7 +172,7 @@ class JobStore:
     def claim(
         self, job_id: str, source_bucket: str, source_key: str, source_version_id: str
     ) -> ClaimResult:
-        from boto3.dynamodb.conditions import Attr
+        from boto3.dynamodb.conditions import Attr, ConditionBase
 
         now = int(time.time())
         token = uuid.uuid4().hex
@@ -173,6 +192,7 @@ class JobStore:
                     "created_at": _now_iso(),
                     "updated_at": _now_iso(),
                     "notification_status": NOTIFICATION_PENDING,
+                    **self._rules_fields(),
                 },
                 ConditionExpression=Attr("job_id").not_exists(),
             )
@@ -192,12 +212,14 @@ class JobStore:
         if status in TERMINAL_STATUSES:
             return ClaimResult(status=ClaimStatus.ALREADY_TERMINAL, record=record)
 
+        condition: ConditionBase
+
         if status == STATUS_PROCESSING:
             if int(record["lease_expires_at"]) >= now:
                 return ClaimResult(status=ClaimStatus.ACTIVE_ELSEWHERE)
             condition = Attr("status").eq(STATUS_PROCESSING) & Attr("lease_expires_at").lt(now)
-        elif status == STATUS_FAILED:
-            condition = Attr("status").eq(STATUS_FAILED)
+        elif status in RECLAIMABLE_STATUSES:
+            condition = Attr("status").eq(status)
         else:
             return ClaimResult(status=ClaimStatus.LOST_RACE)
 
@@ -210,6 +232,7 @@ class JobStore:
                     "attempt_count = attempt_count + :one, "
                     "updated_at = :updated_at, "
                     "notification_status = :notif_pending"
+                    + "".join(f", {name} = :{name}" for name in self._rules_fields())
                 ),
                 ConditionExpression=condition,
                 ExpressionAttributeNames={"#status": "status"},
@@ -220,6 +243,7 @@ class JobStore:
                     ":one": 1,
                     ":updated_at": _now_iso(),
                     ":notif_pending": NOTIFICATION_PENDING,
+                    **{f":{name}": value for name, value in self._rules_fields().items()},
                 },
             )
             return ClaimResult(status=ClaimStatus.OWNED, lease_token=token)
@@ -291,6 +315,11 @@ class JobStore:
                 return False
             raise
 
+    def _rules_fields(self) -> dict[str, Any]:
+        if self._rules is None:
+            return {}
+        return {"schema_name": self._rules[0], "schema_version": self._rules[1]}
+
     def finalize_success(
         self,
         job_id: str,
@@ -304,6 +333,7 @@ class JobStore:
         error_code: str | None = None,
         error_message: str | None = None,
         content_sha256: str | None = None,
+        warning_counts: dict[str, int] | None = None,
     ) -> bool:
         """Records a run that produced reports. `error_code` is set when
         the file still failed validation (no valid rows, or too many
@@ -331,6 +361,9 @@ class JobStore:
         if content_sha256 is not None:
             update_expression += ", content_sha256 = :content_sha256"
             values[":content_sha256"] = content_sha256
+        if warning_counts:
+            update_expression += ", warning_counts = :warning_counts"
+            values[":warning_counts"] = warning_counts
         if error_code is None:
             update_expression += " REMOVE error_code, error_message"
         else:
@@ -382,6 +415,22 @@ class JobStore:
             raise
 
     def mark_failed(self, job_id: str, token: str, *, error_code: str, error_message: str) -> bool:
+        """This attempt did not finish; SQS will deliver the message again."""
+        return self._mark_unfinished(
+            job_id, token, STATUS_FAILED, error_code=error_code, error_message=error_message
+        )
+
+    def mark_dead_lettered(
+        self, job_id: str, token: str, *, error_code: str, error_message: str
+    ) -> bool:
+        """Retrying has stopped; see the module docstring."""
+        return self._mark_unfinished(
+            job_id, token, STATUS_DEAD_LETTERED, error_code=error_code, error_message=error_message
+        )
+
+    def _mark_unfinished(
+        self, job_id: str, token: str, status: str, *, error_code: str, error_message: str
+    ) -> bool:
         from boto3.dynamodb.conditions import Attr
 
         try:
@@ -394,7 +443,7 @@ class JobStore:
                 ConditionExpression=Attr("lease_owner").eq(token),
                 ExpressionAttributeNames={"#status": "status"},
                 ExpressionAttributeValues={
-                    ":status": STATUS_FAILED,
+                    ":status": status,
                     ":updated_at": _now_iso(),
                     ":error_code": error_code,
                     ":error_message": sanitize_error_message(error_message),
