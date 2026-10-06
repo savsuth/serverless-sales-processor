@@ -116,3 +116,24 @@ def test_processed_before_version():
     assert admin.processed_before_version({"schema_version": 1}, 2)
     assert not admin.processed_before_version({"schema_version": 2}, 2)
     assert admin.processed_before_version({}, 1)  # before versions were recorded
+
+
+def test_upload_exists_until_its_version_is_deleted(stack):
+    job_id = _process(stack, "sales.csv")
+    job = stack["table"].get_item(Key={"job_id": job_id})["Item"]
+    assert admin.upload_exists(stack["s3"], job)
+
+    # What an expiring lifecycle rule does in the end: the version is gone.
+    stack["s3"].delete_object(
+        Bucket=INPUT_BUCKET, Key=job["source_key"], VersionId=job["source_version_id"]
+    )
+    assert not admin.upload_exists(stack["s3"], job)
+
+
+def test_upload_behind_a_delete_marker_still_exists(stack):
+    job_id = _process(stack, "sales.csv")
+    job = stack["table"].get_item(Key={"job_id": job_id})["Item"]
+    stack["s3"].delete_object(Bucket=INPUT_BUCKET, Key=job["source_key"])  # delete marker only
+
+    # The version itself is still stored, so it can still be reprocessed.
+    assert admin.upload_exists(stack["s3"], job)

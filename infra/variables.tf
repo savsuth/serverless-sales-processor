@@ -124,6 +124,19 @@ variable "log_retention_days" {
   default     = 30
 }
 
+# --- Retention -----------------------------------------------------------
+
+variable "upload_retention_days" {
+  description = "Days to keep uploaded CSVs in the input bucket. 0 (the default) keeps them forever: the project never deletes data unless this is set. When set, each upload version is kept at least this many days and removed by S3 within twice that; reports and curated data in the output bucket are never expired. An expired upload can no longer be reprocessed (scripts/reprocess.py skips it)."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.upload_retention_days == 0 || var.upload_retention_days >= 30
+    error_message = "upload_retention_days must be 0 (keep forever) or at least 30, so a message redriven from the dead-letter queue (kept 14 days) always finds its upload."
+  }
+}
+
 # --- Notifications -----------------------------------------------------
 
 variable "enable_events" {

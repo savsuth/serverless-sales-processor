@@ -77,6 +77,23 @@ def processed_before_version(job: dict[str, Any], version: int) -> bool:
     return int(job.get("schema_version", 0)) < version
 
 
+def upload_exists(s3: Any, job: dict[str, Any]) -> bool:
+    """Whether the job's exact upload version is still stored. With
+    upload_retention_days set (infra/variables.tf), old uploads expire,
+    and reprocessing one would only fail on every attempt."""
+    try:
+        s3.head_object(
+            Bucket=job["source_bucket"],
+            Key=job["source_key"],
+            VersionId=job["source_version_id"],
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NoSuchVersion"):
+            return False
+        raise
+    return True
+
+
 def request_reprocess(table: Any, sqs: Any, queue_url: str, job: dict[str, Any]) -> bool:
     """Marks one job retryable and queues its original S3 event. Returns
     False, changing nothing, if the job is running or changed status

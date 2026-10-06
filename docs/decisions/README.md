@@ -29,3 +29,4 @@ reliability, monitoring, the portal, encryption, CI, environments).
 | [0018](0018-quality-gates.md) | CI enforces types, coverage, dependency audit and a Terraform scan |
 | [0019](0019-environments.md) | Environments are separate stacks, selected by prefix and state file |
 | [0020](0020-memory-sized-for-cpu.md) | The processor's memory is sized for CPU, from measurements |
+| [0021](0021-upload-retention-opt-in.md) | Uploads are kept forever unless a retention period is set |

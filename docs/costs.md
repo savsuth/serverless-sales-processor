@@ -66,10 +66,13 @@ Notes:
   and costs less than a small file.
 - **Retries.** Each retry repeats an attempt's Lambda time and most of
   its requests.
-- **Storage.** Every upload is kept forever. Both buckets are versioned
-  and nothing expires (`infra/s3.tf`), so storage grows by about 1.3 to
-  1.5 times the input size per file and is billed every month. For
-  example, 10,000 files of 1 MB come to about 13 GB, or 0.30 USD a month.
+- **Storage.** By default every upload is kept forever. Both buckets
+  are versioned and nothing expires (`infra/s3.tf`), so storage grows
+  by about 1.3 to 1.5 times the input size per file and is billed every
+  month. For example, 10,000 files of 1 MB come to about 13 GB, or
+  0.30 USD a month. Setting `upload_retention_days` removes old uploads,
+  which are about 70% of that; reports and curated data stay
+  ([ADR 0021](decisions/0021-upload-retention-opt-in.md)).
 - **KMS.** "Up to 8" is what four back-to-back uploads used: 33 calls,
   counted in CloudTrail. S3 bucket keys, and the five-minute data-key
   reuse that SQS, DynamoDB and SNS apply, mean steady traffic needs

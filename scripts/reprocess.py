@@ -77,6 +77,14 @@ def main() -> int:
     if not selected:
         print("No matching jobs.")
         return 0
+    s3 = boto3.client("s3")
+    expired = [job for job in selected if not admin.upload_exists(s3, job)]
+    for job in expired:
+        print(f"{job['job_id']}  skipped: its upload has expired ({job['source_key']})")
+    selected = [job for job in selected if job not in expired]
+    if not selected:
+        print("No job left to reprocess.")
+        return 1
     for job in selected:
         version = job.get("schema_version", "?")
         print(f"{job['job_id']}  {job['status']:<26} v{version}  {job['source_key']}")
