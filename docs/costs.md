@@ -150,6 +150,7 @@ follows the row count, and the shortest valid row is about 17 bytes
 | File | Local, under moto | Lambda, 512 MB | Lambda, 1024 MB |
 |---|---|---|---|
 | Small (smoke test), warm | | 0.29 to 0.78 s | 0.27 to 0.51 s |
+| Small, warm, clients reused (current code) | | | 0.10 to 0.29 s |
 | 10 MB, 303,030 rows | 3.37 s | 35.97 s | 18.21 s |
 | 10 MiB, 616,807 rows | 6.31 s | about 67 s (scaled, not run) | 34.29 s (cold start) |
 | Peak memory, largest file | | 212 MB | 271 MB |
@@ -165,12 +166,20 @@ margin.
 The cost per file barely moved. The 303,030-row file used 17.98
 GB-seconds at 512 MB and 18.21 at 1024 MB, 1.3% more. A small file's
 fixed time, about 0.3 s of network round trips, now costs twice as
-much, which adds about 0.000002 USD per file. That gives these totals:
+much, which adds about 0.000002 USD per file.
+
+Since then, both Lambdas build their AWS clients once per container
+instead of on every run. That roughly halved a small file's warm time
+again: 0.26 to 0.29 s for a new file and 0.10 s for a duplicate,
+against 0.49 to 0.51 s and 0.27 s before. Warm portal requests now take
+2 to 162 ms, most under 35 ms, against 65 to 207 ms. That gives these
+totals:
 
 | | Small | 10 MB, 303,030 rows |
 |---|---|---|
 | Cost per file at 512 MB | 0.000087 | 0.000378 |
 | Cost per file at 1024 MB | 0.000089 | 0.000381 |
+| At 1024 MB, clients reused (current) | 0.000086 | 0.000381 |
 
 ## How the numbers were measured
 
