@@ -28,9 +28,17 @@ resource "aws_dynamodb_table" "jobs" {
   # status, so they never appear in it.
   global_secondary_index {
     name            = "status-created_at-index"
-    hash_key        = "status"
-    range_key       = "created_at"
     projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "status"
+      key_type       = "HASH"
+    }
+
+    key_schema {
+      attribute_name = "created_at"
+      key_type       = "RANGE"
+    }
   }
 
   point_in_time_recovery {
