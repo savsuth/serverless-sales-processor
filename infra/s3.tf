@@ -126,9 +126,12 @@ resource "aws_s3_bucket_policy" "output" {
   depends_on = [aws_s3_bucket_public_access_block.output]
 }
 
-# Only cleans up abandoned multipart-upload fragments (invisible but
-# billed). Deliberately does NOT expire noncurrent object versions: this
-# project never deletes user data automatically.
+# Always cleans up abandoned multipart-upload fragments (invisible but
+# billed). Uploads expire only if upload_retention_days is set; this
+# project never deletes data unless asked to. Outputs never expire.
+# Expiring a current version adds a delete marker and makes it
+# noncurrent, so noncurrent versions expire after the same period: an
+# upload is kept at least that long, and an overwritten one too.
 resource "aws_s3_bucket_lifecycle_configuration" "abort_incomplete_uploads" {
   for_each = {
     input  = aws_s3_bucket.input.id
@@ -145,6 +148,24 @@ resource "aws_s3_bucket_lifecycle_configuration" "abort_incomplete_uploads" {
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
+    }
+  }
+
+  dynamic "rule" {
+    for_each = each.key == "input" && var.upload_retention_days > 0 ? [var.upload_retention_days] : []
+    content {
+      id     = "expire-uploads"
+      status = "Enabled"
+
+      filter {}
+
+      expiration {
+        days = rule.value
+      }
+
+      noncurrent_version_expiration {
+        noncurrent_days = rule.value
+      }
     }
   }
 

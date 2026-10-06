@@ -379,6 +379,7 @@ list with defaults):
 | `enable_events` | Publish every job outcome to the default EventBridge bus (default `true`). |
 | `enable_portal`, `report_link_days`, `portal_requests_per_second` | The upload page's API and the email download links (default on, links valid 7 days, 10 requests/s). |
 | `enable_kms` | Encrypt data at rest with the project's customer-managed KMS key (default `true`). |
+| `upload_retention_days` | Days to keep uploaded CSVs (default `0`, keep forever; otherwise at least 30). Reports and curated data never expire; an expired upload can no longer be reprocessed. |
 | `enable_budget_alert`, `budget_limit_usd`, `budget_alert_email` | Optional AWS Budget alert. |
 
 Set these in a gitignored `infra/terraform.tfvars`. `infra/bootstrap` has
@@ -498,12 +499,15 @@ AWS_PROFILE=<profile> python scripts/reprocess.py --status completed --older-tha
 ```
 
 If the profile comes from `aws login`, boto3 needs the optional
-`botocore[crt]` package to read it; otherwise export the session first
-with `eval "$(aws configure export-credentials --profile <profile> --format env)"`
-(`make smoke` does this for you).
+`botocore[crt]` package to read it. Otherwise export the session and
+its region first, and run without `AWS_PROFILE`:
+`eval "$(aws configure export-credentials --profile <profile> --format env)"`
+and `export AWS_DEFAULT_REGION=<region>` (`make smoke` does this for
+you).
 
 A reprocessed job overwrites its own outputs, so nothing is counted
-twice.
+twice. If `upload_retention_days` is set, jobs whose upload has expired
+are listed as skipped rather than queued.
 
 ### Monitoring and events
 
