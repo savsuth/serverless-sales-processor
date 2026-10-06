@@ -66,7 +66,7 @@ variable "athena_month_range" {
 # gives CPU in proportion to memory, so memory is the lever for time.
 
 variable "lambda_timeout_seconds" {
-  description = "Lambda function timeout. At the default 1024 MB the worst-case 10 MiB file needs about 34 s (measured scaling, docs/costs.md), leaving headroom. Must stay below job_lease_seconds."
+  description = "Lambda function timeout. At the default 1024 MB the worst-case 10 MiB file took 34.3 s (docs/costs.md), leaving headroom. Must stay below job_lease_seconds."
   type        = number
   default     = 60
 }

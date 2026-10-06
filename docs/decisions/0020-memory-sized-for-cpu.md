@@ -15,13 +15,15 @@ it would fail every attempt and end `dead_lettered`. Peak memory for a
 ## Decision
 
 The default memory is 1024 MB. Lambda gives CPU in proportion to
-memory, which roughly halves the time: about 34 s for the worst case.
+memory, and the measured time halved: the worst-case file finished in
+34.3 s, and a 303,030-row file in 18.2 s instead of 36.0 s.
 The timeout stays at 60 s, so its ordering below the lease
 ([0003](0003-timeout-lease-visibility-ordering.md)) is unchanged.
 
 ## Consequences
 
 - Cost per file barely changes: CPU-bound work at twice the memory
-  takes about half the time.
+  takes about half the time (18.21 GB-seconds against 17.98 for the
+  303,030-row file).
 - If the size limit or the schema grows, re-measure before raising the
   timeout. Memory up to 1,769 MB (one full vCPU) is the cheaper lever.

@@ -1,7 +1,9 @@
 # What the pipeline costs
 
 Measured on 2026-10-06 against the deployed stack in us-east-2 (Lambda on
-arm64, processor at 512 MB), priced with the AWS public price list for
+arm64). The per-file tables below are from runs at 512 MB; the processor
+now runs at 1024 MB, measured in [Timeout headroom](#timeout-headroom),
+and its cost per file is within 3% of these. Prices come from the AWS public price list for
 US East (Ohio) as published in September and October 2026. All amounts
 are list prices in USD **before** free tiers. The always-free tiers
 (below) cover most of a small deployment.
@@ -17,12 +19,14 @@ are list prices in USD **before** free tiers. The always-free tiers
   about 0.002 USD for each hour that has at least one upload. That is
   more than processing a single 10 MiB file.
 - **Size the Lambda by its CPU, not its memory.** At 512 MB, a 10 MiB
-  file of the shortest valid rows would need about 67 s and miss the
-  60 s timeout. See [Timeout headroom](#timeout-headroom).
+  file of the shortest valid rows would have needed about 67 s, missing
+  the 60 s timeout. At 1024 MB it took 34.3 s. See
+  [Timeout headroom](#timeout-headroom).
 
 ## Per file
 
-Three measured files, each processed once and ending `completed`:
+Three measured files at 512 MB, each processed once and ending
+`completed`:
 
 | | Small | 1 MB | 10 MB |
 |---|---|---|---|
@@ -140,23 +144,30 @@ decompression (the limit counts decompressed bytes). Processing time
 follows the row count, and the shortest valid row is about 17 bytes
 (`2024-03-28,B,5,2`), so the worst case is about 617,000 rows.
 
-| File | Local, under moto | Lambda, 512 MB |
+| File | Local, under moto | Lambda, 512 MB | Lambda, 1024 MB |
+|---|---|---|---|
+| Small (smoke test), warm | | 0.29 to 0.78 s | 0.27 to 0.51 s |
+| 10 MB, 303,030 rows | 3.37 s | 35.97 s | 18.21 s |
+| 10 MiB, 616,807 rows | 6.31 s | about 67 s (scaled, not run) | 34.29 s (cold start) |
+| Peak memory, largest file | | 212 MB | 271 MB |
+
+At 512 MB the worst case would have timed out on every attempt and
+ended `dead_lettered`, although the file is within the documented
+limit. Lambda gives CPU in proportion to memory, with one full vCPU at
+1,769 MB, so the default is now 1024 MB (`infra/variables.tf`,
+[ADR 0020](decisions/0020-memory-sized-for-cpu.md)). The measured time
+halved, and the worst case now finishes in 34.3 s, leaving 25 s of
+margin.
+
+The cost per file barely moved. The 303,030-row file used 17.98
+GB-seconds at 512 MB and 18.21 at 1024 MB, 1.3% more. A small file's
+fixed time, about 0.3 s of network round trips, now costs twice as
+much, which adds about 0.000002 USD per file. That gives these totals:
+
+| | Small | 10 MB, 303,030 rows |
 |---|---|---|
-| 10 MB, 303,030 rows | 3.37 s | 35.97 s (measured) |
-| 10 MiB, 616,807 rows | 6.31 s | about 67 s (scaled) |
-
-At 512 MB the worst case would time out on every attempt and end
-`dead_lettered`, although the file is within the documented limit.
-
-Lambda gives CPU in proportion to memory: one full vCPU at 1,769 MB.
-The default is therefore 1024 MB (`infra/variables.tf`). That roughly
-halves the time, to about 34 s for the worst case. Peak memory for a
-10 MB file was 212 MB, so the extra memory buys CPU, not space.
-
-The cost per file barely moves. CPU-bound work at twice the memory
-takes about half the time, so the GB-seconds stay about the same. Only
-the fixed part of each run, about 0.3 s of network round trips, costs
-twice as much: under 0.000002 USD more per file.
+| Cost per file at 512 MB | 0.000087 | 0.000378 |
+| Cost per file at 1024 MB | 0.000089 | 0.000381 |
 
 ## How the numbers were measured
 
@@ -166,9 +177,10 @@ twice as much: under 0.000002 USD more per file.
   @maxMemoryUsed, @initDuration`. Since August 2025, billed duration
   includes the init phase of a cold start; the cold 100 KB run
   (1,961 rows) billed 2.76 s.
-- **Test files.** The 1 MB and 10 MB files were synthetic and uploaded
-  under `smoke-test/cost/`. Their rows are dated 1999, so Athena's
-  partition projection (`2000-01,NOW`) never shows them in queries.
+- **Test files.** The 1 MB and 10 MB files and the worst-case file
+  were synthetic and uploaded under `smoke-test/cost/`. Their rows are
+  dated 1999, so Athena's partition projection (`2000-01,NOW`) never
+  shows them in queries.
 - **AWS calls per file.** The deployed handler was run under moto with
   a botocore `before-call` hook counting every request. Each outcome
   makes a fixed number of calls:
